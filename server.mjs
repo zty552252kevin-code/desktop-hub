@@ -34,7 +34,9 @@ const BACKENDS = {
   },
   oss: {
     command: "npx",
-    args: ["--yes", "--prefer-offline", "@zavora-ai/computer-use-mcp"],
+    // Exact-pinned: a surprise major bump would silently change tool
+    // names/behavior under desk_call. Bump deliberately via env or here.
+    args: ["--yes", "--prefer-offline", process.env.DESKTOP_HUB_OSS_SPEC || "@zavora-ai/computer-use-mcp@7.0.0"],
   },
 };
 
