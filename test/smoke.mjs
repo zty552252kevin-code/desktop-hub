@@ -7,6 +7,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { execFileSync } from "node:child_process";
+import { existsSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -49,6 +50,27 @@ const rsCjk = await client.callTool({ name: "run_script", arguments: { language:
 check("run_script CJK intact", !rsCjk.isError && textOf(rsCjk).includes("中文输出正常"), textOf(rsCjk).slice(0, 120));
 const rsErr = await client.callTool({ name: "run_script", arguments: { language: "applescript", script: "error \"boom\"" } });
 check("run_script error surfaces", rsErr.isError && textOf(rsErr).includes("boom"), textOf(rsErr).slice(0, 120));
+// Language is normalized (uppercase "JXA" must NOT silently run as AppleScript)
+const rsJxa = await client.callTool({ name: "run_script", arguments: { language: "JXA", script: "'jxa-ok'" } });
+check("run_script JXA case-insensitive", !rsJxa.isError && textOf(rsJxa).trim() === "jxa-ok", textOf(rsJxa).slice(0, 120));
+const rsBadLang = await client.callTool({ name: "run_script", arguments: { language: "python", script: "1" } });
+check("run_script rejects unknown language", rsBadLang.isError && textOf(rsBadLang).includes("unknown language"), textOf(rsBadLang).slice(0, 120));
+// Huge output must NOT kill the script (side effects after the flood must
+// land) and the returned body must be clipped, not the raw megabytes.
+const SFX = `/tmp/hub-smoke-sfx-${process.pid}`;
+try { unlinkSync(SFX); } catch { /* stale */ }
+const rsBig = await client.callTool({ name: "run_script", arguments: { language: "jxa", script: `
+  ObjC.import('Foundation');
+  const out = $.NSFileHandle.fileHandleWithStandardOutput;
+  const data = $('x'.repeat(1 << 20)).dataUsingEncoding($.NSUTF8StringEncoding);
+  out.writeData(data); out.writeData(data); out.writeData(data);
+  $.NSFileManager.defaultManager.createFileAtPathContentsAttributes(${JSON.stringify(SFX)}, $.NSData.data, $());
+  'end';
+` } }, undefined, { timeout: 120_000 });
+const bigText = textOf(rsBig);
+check("run_script 3MB output: script survives (side effect landed)", existsSync(SFX));
+check("run_script 3MB output: returned body clipped", !rsBig.isError && bigText.includes("chars dropped") && bigText.length < 20_000, `len=${bigText.length}`);
+try { unlinkSync(SFX); } catch { /* already gone */ }
 
 // 4. cua backend round-trip (spawns backend lazily)
 const lw = await client.callTool({ name: "list_windows", arguments: {} }, undefined, { timeout: 60_000 });
