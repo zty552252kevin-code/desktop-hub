@@ -13,6 +13,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  McpError,
+  ErrorCode,
 } from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -46,10 +48,25 @@ function getClient(name) {
       const transport = new StdioClientTransport({
         command: BACKENDS[name].command,
         args: BACKENDS[name].args,
-        stderr: "ignore",
+        stderr: "pipe",
+        // Default 10MB read cap kills the connection on big base64 screenshots.
+        maxBufferSize: 256 * 1024 * 1024,
       });
       const client = new Client({ name: "desktop-hub", version: "0.1.0" });
-      await client.connect(transport);
+      let errTail = "";
+      transport.stderr?.on("data", (d) => {
+        errTail = (errTail + d).slice(-2000);
+      });
+      try {
+        // Explicit handshake timeout: default is 60s, too tight for a cold
+        // npx spawn, and CALL_TIMEOUT_MS otherwise only covers callTool.
+        await client.connect(transport, { timeout: CALL_TIMEOUT_MS });
+      } catch (err) {
+        throw new Error(
+          `backend "${name}" failed to start: ${err?.message ?? err}` +
+            (errTail ? `\n--- ${name} stderr ---\n${errTail}` : "")
+        );
+      }
       // Client.connect() takes over transport.onclose, so evict through the
       // client-level callback — otherwise a dead backend is never respawned.
       client.onclose = () => {
@@ -67,9 +84,20 @@ function getClient(name) {
 
 async function backendCall(backend, tool, args) {
   const client = await getClient(backend);
-  return client.callTool({ name: tool, arguments: args ?? {} }, undefined, {
-    timeout: CALL_TIMEOUT_MS,
-  });
+  try {
+    return await client.callTool({ name: tool, arguments: args ?? {} }, undefined, {
+      timeout: CALL_TIMEOUT_MS,
+    });
+  } catch (err) {
+    // A hung-but-alive backend never fires onclose; evict + kill it here so
+    // the next call respawns instead of eating 180s per call forever.
+    if (err instanceof McpError && err.code === ErrorCode.RequestTimeout) {
+      delete clients[backend];
+      delete toolCatalog[backend];
+      client.close().catch(() => {});
+    }
+    throw err;
+  }
 }
 
 async function backendTools(backend) {
@@ -79,7 +107,7 @@ async function backendTools(backend) {
       const out = [];
       let cursor;
       do {
-        const page = await client.listTools({ cursor });
+        const page = await client.listTools({ cursor }, { timeout: CALL_TIMEOUT_MS });
         out.push(...page.tools);
         cursor = page.nextCursor;
       } while (cursor);
@@ -110,14 +138,14 @@ const TARGETING = {
 
 const ACTIONS = {
   click: { tool: "click", map: { ...TARGETING, x: "x", y: "y", button: "button", count: "count", modifiers: "modifier", scope: "scope" } },
-  double_click: { tool: "double_click", map: { ...TARGETING, x: "x", y: "y" } },
-  right_click: { tool: "right_click", map: { ...TARGETING, x: "x", y: "y", modifiers: "modifier" } },
+  double_click: { tool: "double_click", req: ["pid"], map: { ...TARGETING, x: "x", y: "y" } },
+  right_click: { tool: "right_click", req: ["pid"], map: { ...TARGETING, x: "x", y: "y", modifiers: "modifier" } },
   type: { tool: "type_text", req: ["text"], map: { ...TARGETING, x: "x", y: "y", text: "text", scope: "scope" } },
   key: { tool: "press_key", req: ["key"], map: { ...TARGETING, x: "x", y: "y", key: "key", modifiers: "modifiers", scope: "scope" } },
   hotkey: { tool: "hotkey", req: ["keys"], map: { ...TARGETING, x: "x", y: "y", keys: "keys", scope: "scope" } },
-  scroll: { tool: "scroll", req: ["direction"], map: { ...TARGETING, x: "x", y: "y", direction: "direction", amount: "amount", scope: "scope" } },
-  drag: { tool: "drag", req: ["x", "y", "to_x", "to_y"], map: { pid: "pid", window_id: "window_id", session: "session", delivery_mode: "delivery_mode", x: "from_x", y: "from_y", to_x: "to_x", to_y: "to_y", modifiers: "modifier", scope: "scope" } },
-  set_value: { tool: "set_value", req: ["value"], map: { pid: "pid", window_id: "window_id", element_token: "element_token", element_index: "element_index", snapshot_id: "snapshot_id", session: "session", value: "value" } },
+  scroll: { tool: "scroll", req: ["direction"], map: { ...TARGETING, x: "x", y: "y", direction: "direction", amount: "amount", by: "by", scope: "scope" } },
+  drag: { tool: "drag", req: ["x", "y", "to_x", "to_y"], map: { pid: "pid", window_id: "window_id", session: "session", delivery_mode: "delivery_mode", x: "from_x", y: "from_y", to_x: "to_x", to_y: "to_y", button: "button", modifiers: "modifier", scope: "scope" } },
+  set_value: { tool: "set_value", req: ["pid", "value"], map: { pid: "pid", window_id: "window_id", element_token: "element_token", element_index: "element_index", snapshot_id: "snapshot_id", session: "session", value: "value" } },
   menu: { tool: "invoke_menu", req: ["pid", "window_id", "path"], map: { pid: "pid", window_id: "window_id", session: "session", path: "path" } },
 };
 
@@ -146,15 +174,33 @@ function runOsascript(language, script, timeoutS) {
     const child = spawn("osascript", ["-l", lang, "-"], {
       timeout: Math.min(Math.max(timeoutS ?? 60, 1), 600) * 1000,
     });
-    let stdout = "", stderr = "";
-    child.stdout.on("data", (d) => (stdout += d));
-    child.stderr.on("data", (d) => (stderr += d));
+    // setEncoding buffers partial multibyte sequences across pipe chunks
+    // (naive `+= buffer` splits CJK chars into U+FFFD at chunk boundaries).
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    const CAP = 1 << 20; // 1MB per stream; runaway output would crash the hub
+    let stdout = "", stderr = "", truncated = false;
+    child.stdout.on("data", (d) => {
+      if (truncated) return;
+      stdout += d;
+      if (stdout.length > CAP) { stdout = stdout.slice(0, CAP); truncated = true; child.kill("SIGKILL"); }
+    });
+    child.stderr.on("data", (d) => {
+      if (truncated) return;
+      stderr += d;
+      if (stderr.length > CAP) { stderr = stderr.slice(0, CAP); truncated = true; child.kill("SIGKILL"); }
+    });
     child.on("error", (err) => resolve({ ok: false, text: `spawn error: ${err.message}` }));
     child.on("close", (code, signal) => {
+      let body = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n--- stderr ---\n");
+      if (truncated) return resolve({ ok: false, text: `output truncated at 1MB; child killed\n${body}` });
       if (signal) return resolve({ ok: false, text: `killed by ${signal} (timeout?)\n${stderr}`.trim() });
-      const body = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n--- stderr ---\n");
       resolve({ ok: code === 0, text: code === 0 ? (body || "(no output)") : `exit ${code}\n${body}` });
     });
+    // If osascript dies before draining stdin, the pending write emits an
+    // 'error' that would otherwise crash the process; 'close' reports the
+    // real failure, so swallow the stream error.
+    child.stdin.on("error", () => {});
     child.stdin.end(script);
   });
 }
@@ -218,12 +264,12 @@ const TOOLS = [
     description:
       "Perform one desktop action (via cua; background delivery by default — no cursor/focus steal). Actions: click, double_click, right_click, type (insert text), key (single key e.g. return/tab/escape), hotkey (combo e.g. [\"cmd\",\"c\"]), scroll, drag, set_value (text field/dropdown direct set), menu (invoke exact app-menu path). " +
       TARGET_NOTE +
-      " Per-action params: type→text; key→key(+modifiers); hotkey→keys; scroll→direction(+amount); drag→x,y (from) + to_x,to_y; set_value→value; menu→pid,window_id,path.",
+      " Per-action params: type→text; key→key(+modifiers); hotkey→keys; scroll→direction(+amount,by); drag→x,y (from) + to_x,to_y; set_value→pid,value; menu→pid,window_id,path. pid is REQUIRED for double_click, right_click, set_value, menu (element_token alone insufficient; scope:'desktop' unsupported for these — desktop double-click = action:'click' with extra:{count:2}).",
     inputSchema: {
       type: "object",
       properties: {
         action: { type: "string", enum: ["click", "double_click", "right_click", "type", "key", "hotkey", "scroll", "drag", "set_value", "menu"] },
-        pid: { type: "integer", description: "Target process ID." },
+        pid: { type: "integer", description: "Target process ID. Required for double_click, right_click, set_value, menu." },
         window_id: { type: "integer", description: "Required with element_index; optional with element_token." },
         element_token: { type: "string", description: "Preferred: opaque handle from window_state elements." },
         element_index: { type: "integer", description: "From window_state; needs snapshot_id + window_id." },
@@ -238,13 +284,14 @@ const TOOLS = [
         value: { type: "string", description: "for set_value." },
         direction: { type: "string", enum: ["up", "down", "left", "right"], description: "for scroll." },
         amount: { type: "integer", description: "scroll notches, default 3." },
+        by: { type: "string", enum: ["line", "page"], description: "scroll granularity, default line (page = PageDown/PageUp-sized steps)." },
         path: { type: "array", items: { type: "string" }, description: "for menu: exact menu path, e.g. [\"File\",\"Export…\"]. Case-sensitive." },
         button: { type: "string", enum: ["left", "right", "middle"] },
         modifiers: { type: "array", items: { type: "string" }, description: "cmd/shift/option/ctrl held during click/key." },
         scope: { type: "string", enum: ["window", "desktop"], description: "desktop = frontmost app / desktop-px coords, no pid needed." },
         delivery_mode: { type: "string", enum: ["background", "foreground"], description: "Default background (no focus steal)." },
         session: { type: "string" },
-        extra: { type: "object", description: "Escape hatch: merged verbatim into the upstream cua call (e.g. {count:2}, {from_zoom:true})." },
+        extra: { type: "object", description: "Escape hatch: merged verbatim into the upstream cua call (e.g. {count:2}; {from_zoom:true} — click/drag only)." },
       },
       required: ["action"],
     },
@@ -259,7 +306,7 @@ const TOOLS = [
         pid: { type: "integer" },
         window_id: { type: "integer" },
         expect: { type: "array", items: { type: "object" }, description: "Predicate objects, see tool description." },
-        timeout_ms: { type: "integer", description: "Bounded wait; 0 = single sample." },
+        timeout_ms: { type: "integer", minimum: 0, maximum: 10000, description: "Wait up to this many ms (0-10000, default 5000); 0 = single sample." },
         include_screenshot: { type: "boolean", description: "Also return final screenshot as visual evidence." },
         session: { type: "string" },
       },
@@ -268,11 +315,11 @@ const TOOLS = [
   },
   {
     name: "zoom",
-    description: "Cropped close-up JPEG of a window region (x1,y1)-(x2,y2) in screenshot px (via cua). For small text. Then pass extra:{from_zoom:true} to act for zoom-image coordinates.",
+    description: "Cropped close-up JPEG of a window region (x1,y1)-(x2,y2) in screenshot px (via cua). For small text. To act on what you see: call zoom WITH pid, then act click/drag with extra:{from_zoom:true} (x,y in zoom-image px). Other actions ignore from_zoom (coords would land wrong) — from_zoom-click the field first, then act type.",
     inputSchema: {
       type: "object",
       properties: {
-        pid: { type: "integer" },
+        pid: { type: "integer", description: "Required if you will use from_zoom afterwards." },
         window_id: { type: "integer" },
         x1: { type: "number" }, y1: { type: "number" }, x2: { type: "number" }, y2: { type: "number" },
       },
@@ -341,8 +388,12 @@ async function handleCall(name, input) {
       const { tool, args } = buildActArgs(input);
       return backendCall("cua", tool, args);
     }
-    case "verify":
-      return backendCall("cua", "verify_state", pick(input, ["pid", "window_id", "expect", "timeout_ms", "include_screenshot", "session"]));
+    case "verify": {
+      const a = pick(input, ["pid", "window_id", "expect", "timeout_ms", "include_screenshot", "session"]);
+      // Upstream rejects (not clamps) out-of-range timeout_ms.
+      if (typeof a.timeout_ms === "number") a.timeout_ms = Math.min(Math.max(a.timeout_ms, 0), 10000);
+      return backendCall("cua", "verify_state", a);
+    }
     case "zoom":
       return backendCall("cua", "zoom", pick(input, ["pid", "window_id", "x1", "y1", "x2", "y2"]));
     case "run_script": {
@@ -407,3 +458,20 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+// SDK 1.30.0's StdioServerTransport never fires onclose on stdin EOF (it only
+// listens for 'data'), and the spawned backends are ref'd children that would
+// keep this process — and themselves — alive forever after the host exits.
+let shuttingDown = false;
+async function shutdown(code = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const pending = Object.values(clients);
+  await Promise.allSettled(pending.map((p) => p.then((c) => c.close()))); // stdin.end → SIGTERM → SIGKILL
+  process.exit(code);
+}
+process.stdin.on("end", () => shutdown(0));
+process.stdin.on("close", () => shutdown(0));
+process.on("SIGINT", () => shutdown(0));
+process.on("SIGTERM", () => shutdown(0));
+server.onclose = () => shutdown(0);
