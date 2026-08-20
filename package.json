@@ -1,0 +1,14 @@
+{
+  "name": "desktop-hub",
+  "version": "0.1.0",
+  "description": "Compact facade MCP server aggregating cua-driver + computer-use-oss + osascript",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  }
+}
