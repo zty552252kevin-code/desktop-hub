@@ -37,6 +37,10 @@ claude mcp add desktop-hub -s user -- node /Users/kevin/desktop-hub/server.mjs
 ## 依赖与坑
 
 - 依赖 `~/.local/bin/cua-driver`（可用 `DESKTOP_HUB_CUA_BIN` 覆盖）与 npx 缓存里的 `@zavora-ai/computer-use-mcp`。
-- oss 首次调用要 spawn npx，慢几秒，属正常。
+- oss 首次调用要 spawn npx，慢几秒，属正常（握手超时已放宽到 180s，失败会附带 stderr 尾巴）。
 - 计算器等 SwiftUI 应用的显示值可能带不可见字符（如 U+200E），`verify` 的 `value_equals` 精确匹配会 unknown，改用 `label_contains` 或读 window_state markdown。
-- 后端进程崩溃会被自动清理并在下次调用时重新拉起（依赖 `client.onclose`，不是 `transport.onclose`——后者会被 SDK 覆写）。
+- 后端进程崩溃会被自动清理并在下次调用时重新拉起（依赖 `client.onclose`，不是 `transport.onclose`——后者会被 SDK 覆写）；后端假死时该次调用报 RequestTimeout 并自动杀掉重生。
+- 宿主退出（stdin EOF/SIGTERM/SIGINT）会级联关停两个后端子进程，不留孤儿。
+- `act` 的 double_click/right_click/set_value/menu 必须带 `pid`（上游硬性要求，element_token 不能替代）；桌面范围双击用 `action:"click"` + `extra:{count:2}`。
+- `run_script` 输出每流上限 1MB（超限杀进程并标注截断）；多字节中文跨管道块不再出乱码。
+- 2026-08-20 经 21-agent 评审工作流对抗验证，修复 15 项确认缺陷（见 git log 294bacc）。
