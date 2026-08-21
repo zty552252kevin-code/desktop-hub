@@ -90,16 +90,20 @@ if (process.env.DESKTOP_HUB_TEST_OSS === "1") {
   console.log("skip oss backend (set DESKTOP_HUB_TEST_OSS=1 to include)");
 }
 
-// 6. clean shutdown: closing our side must reap the server AND its backends
+// 6. clean shutdown: closing our side must reap OUR server AND its backends.
+// Check by pid, not by pgrep name-match — other MCP hosts (live Claude Code
+// sessions) legitimately run their own desktop-hub instances concurrently.
 await client.close();
 await new Promise((r) => setTimeout(r, 2500));
-let alive = "";
-try { alive = execFileSync("pgrep", ["-lf", `node ${SERVER}`], { encoding: "utf8" }); } catch { /* no match = good */ }
-check("server exits on host close", alive.trim() === "", alive.trim());
 if (serverPid) {
+  let serverAlive = true;
+  try { process.kill(serverPid, 0); } catch { serverAlive = false; }
+  check("server exits on host close", !serverAlive, `pid ${serverPid} still alive`);
   let kids = "";
   try { kids = execFileSync("pgrep", ["-lP", String(serverPid)], { encoding: "utf8" }); } catch { /* none = good */ }
   check("no orphaned backends", kids.trim() === "", kids.trim());
+} else {
+  check("server exits on host close", false, "could not determine server pid");
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : "\nall green");
