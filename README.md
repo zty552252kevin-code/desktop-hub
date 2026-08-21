@@ -64,8 +64,8 @@ Only if you previously registered `cua-driver` or `computer-use-mcp` as standalo
 ### Verify
 
 ```bash
-npm test                        # 20 checks; spawns the real driver and runs osascript on your desktop
-DESKTOP_HUB_TEST_OSS=1 npm test # also exercises the oss backend (slow first npx spawn, needs network)
+npm test                        # 23 checks; spawns the real driver and runs osascript on your desktop
+DESKTOP_HUB_TEST_OSS=1 npm test # +1 check: also exercises the oss backend (slow first npx spawn, needs network)
 ```
 
 The suite requires cua-driver installed with permissions granted — failures without them are setup issues, not hub bugs.
@@ -81,12 +81,15 @@ The suite requires cua-driver installed with permissions granted — failures wi
 ## Design notes & pitfalls (hard-won)
 
 - Crashed backends are auto-evicted and respawned on next call (via `client.onclose` — `transport.onclose` gets overwritten by the SDK). Hung backends: the call fails with RequestTimeout and the backend is killed + respawned; `desk_describe`'s listTools path evicts too. All evictions are **generation-guarded** so a late `onclose` from an old process can never delete a freshly respawned client (which would orphan it and strand every `element_token`).
+- Backend outputSchema validation is deliberately disarmed. cua-driver 0.20.0 returns envelopes that violate its own declared outputSchema, and the SDK client arms validation lazily — only after `listTools()`. With a real validator every cua tool works until the first `desk_describe`, then every call throws `-32602` **after the upstream action already executed** (success misreported as failure). The injected validator returns `undefined` rather than an always-pass function: the SDK's sibling check ("has an output schema but did not return structured content", `-32600`) fires on any *truthy* cached validator, before the validator is even invoked. The hub passes results through verbatim; the host's own client still validates the hub's tools.
 - Host exit (stdin EOF / SIGTERM / SIGINT) cascades shutdown to both backends, **bounded at 5s** — a mid-handshake npx cold start can't keep a host-less hub alive for the 180s handshake window; still-connecting children get force-killed.
 - Host-side cancellation (e.g. Esc in Claude Code) genuinely aborts: the abort signal is threaded into upstream `callTool` and kills the `osascript` child, so a queued click/script never lands on the real desktop after you cancel.
 - `act`: `double_click`/`right_click`/`set_value`/`menu` require `pid` (upstream hard requirement — `element_token` alone is not enough); desktop-scope double-click = `action:"click"` + `extra:{count:2}`. `scope:"desktop"` must not carry `pid`/`window_id` — the facade strips them automatically. Pixel-path drag/scroll on multi-window apps needs `window_id` or upstream refuses as ambiguous. Target-less scroll (pid only) sends arrow/PageDown keys to the focused control — pass `element_token` or `x,y` to wheel-scroll a specific spot.
 - Coordinate spaces differ across backends: `desktop_screenshot` returns **true screen pixels** (2x on Retina) — correct for cua `scope:"desktop"`; oss pointer tools via `desk_call` use **logical points** (1x). Divide by the returned scale factor, or take coordinates from `desk_call oss screenshot`.
 - `run_script`: language is case-insensitive with unknown values rejected loudly; output past 1MB/stream is drained (the script runs to completion, side effects intact) while the returned body is clipped to 8KB with a dropped-bytes note; multibyte CJK never splits across pipe chunks.
 - SwiftUI apps (e.g. Calculator) may embed invisible characters (U+200E) in display values — `verify`'s `value_equals` then returns `unknown`; use `label_contains` or read the `window_state` markdown instead.
+- iPad-ported apps ("Designed for iPad", e.g. rednote/小红书) are a blind spot for synthetic input: background-posted scroll/drag and synthetic long-press gestures are ignored entirely (transport reports success, nothing happens). The only working fallback is `desk_call` into the oss backend's pointer tools (HID-level — but they move the real cursor); `run_script` can't produce these gestures either (iPad ports expose no AppleScript dictionary, and System Events has no scroll/drag/long-press primitives).
+- `window_state`'s grounding screenshot can lag the live frame. For verification that must be current, take a fresh `desktop_screenshot` (or use native `screencapture`) instead of trusting the bundled image.
 - Adversarially reviewed in two multi-agent rounds (21 + 20 reviewers, 28 confirmed defects fixed — round 2 caught two regressions introduced by round-1 fixes). Regression suite in `test/smoke.mjs`.
 
 ## Third-party tools
@@ -125,15 +128,18 @@ claude mcp add desktop-hub -s user -- node "$(pwd)/server.mjs"   # 必须绝对�
 
 此前如果单独注册过 cua/oss 两个 MCP 服务器，把它们 disable 掉由本 hub 接管；全新安装跳过这步。
 
-验证：`npm test`（20 项检查，会真实驱动桌面；`DESKTOP_HUB_TEST_OSS=1` 含 oss 后端）。环境变量见上方英文表格。
+验证：`npm test`（23 项检查，会真实驱动桌面；`DESKTOP_HUB_TEST_OSS=1` 再加 1 项 oss 后端检查）。环境变量见上方英文表格。
 
 ## 坑（血泪换来的）
 
 - 后端崩溃自动清理、下次调用重生（依赖 `client.onclose`，`transport.onclose` 会被 SDK 覆写）；假死后端该次调用报 RequestTimeout 并杀掉重生，`desk_describe` 的 listTools 超时同样驱逐。所有驱逐带**代际守卫**：旧进程迟到的 onclose 不会误删刚重生的新 client（否则孤儿化新后端 + element_token 全部失效）。
+- 对后端的 outputSchema 校验刻意解除。cua-driver 0.20.0 的返回信封违反它自己声明的 outputSchema，而 SDK 客户端的校验是懒生效的——`listTools()` 之后才缓存校验器。真校验时的表现是：cua 工具一切正常，直到第一次 `desk_describe`，之后每次调用都抛 `-32602`——而且**上游动作其实已经执行了**（成功被误报成失败，自动化最坏的失败模式）。注入的校验器返回 `undefined` 而非"永远通过"的函数：SDK 还有个姊妹检查（声明了 outputSchema 却没返回 structuredContent 即抛 `-32600`），只要缓存的校验器为 truthy 就会触发，且发生在校验函数被调用之前。hub 原样透传结果；宿主自己的客户端仍会校验 hub 的工具。
 - 宿主退出级联关停两个后端、**限时 5s** 强退，握手中的子进程也会被补刀（否则 npx 冷启动握手期能把无宿主 hub 拖 180s）。
 - 宿主取消（Esc）真正中止：信号贯通到上游 callTool 和 osascript 子进程，取消后排队的点击/脚本不会再落到真桌面。
 - `act`：double_click/right_click/set_value/menu 必须带 `pid`（上游硬性要求）；`scope:"desktop"` 禁止携带 pid/window_id（facade 自动剔除）；多窗口应用的像素 drag/scroll 必须带 `window_id`；无目标 scroll 走键击路径（发给焦点控件），要滚指定区域必须给 element_token 或 x,y。
 - 坐标系不同：`desktop_screenshot` 是 Retina 真像素（2x），cua desktop-scope 用它；oss 指针工具用逻辑坐标（1x），要除以 scale factor 或从 `desk_call oss screenshot` 取坐标。
 - `run_script`：language 大小写不敏感、未知值明确报错；输出超 1MB 不杀脚本（继续排水跑完、副作用完整），回传剪裁到 8KB 并标注丢弃量；中文跨管道块不出乱码。
 - SwiftUI 应用显示值可能带 U+200E 隐形字符，`verify` 的 `value_equals` 会 unknown，改用 `label_contains`。
+- iPad 移植应用（"专为 iPad 设计"，如小红书）是合成输入的盲区：后台投递的 scroll/drag 和一切合成长按拖拽手势完全免疫（transport 报成功、实际没反应）。唯一有效的兜底是 `desk_call` 调 oss 后端的指针工具（HID 层——但会动真实光标）；`run_script` 也救不了（iPad 移植应用没有 AppleScript 字典，System Events 也没有滚动/拖拽/长按原语）。
+- `window_state` 附带的截图可能是陈旧帧。要求"此刻"准确的核验请另拍 `desktop_screenshot`（或原生 `screencapture`），别只信附带的图。
 - 经两轮多 agent 对抗评审（21+20 个审查员）累计修复 28 项确认缺陷（第二轮抓出第一轮两个修复自身引入的回归）。

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Regression smoke test for desktop-hub. Run: npm test
 // Covers: tool surface + token budget, facade validation fast-fails, cua
-// backend round-trip, run_script, verify clamp, clean shutdown (no orphans).
+// backend round-trip, run_script, output-validation passthrough (real cua +
+// deterministic fixture), clean shutdown (no orphans).
 // Set DESKTOP_HUB_TEST_OSS=1 to also exercise the oss backend (slow npx spawn).
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -81,8 +82,49 @@ const ddTool = await client.callTool({ name: "desk_describe", arguments: { serve
 check("desk_describe cua tool schema", !ddTool.isError && textOf(ddTool).includes("inputSchema"));
 const ddMiss = await client.callTool({ name: "desk_describe", arguments: { server: "cua", tool: "no_such" } });
 check("desk_describe unknown tool errors", ddMiss.isError && textOf(ddMiss).includes("not found"));
+// 5. -32602 time bomb regression: desk_describe's listTools() makes the SDK
+// client cache output validators, and cua 0.20.0 responses violate their own
+// declared outputSchema — with real validation every cua tool is broken from
+// this point on (worst case: upstream action ran, caller told it failed).
+// Must stay green with the passthrough validator.
+const lw2 = await client.callTool({ name: "list_windows", arguments: {} }, undefined, { timeout: 60_000 });
+check("cua tools survive desk_describe (-32602 defused)", !lw2.isError && textOf(lw2).length > 0, textOf(lw2).slice(0, 160));
 
-// 5. optional oss backend
+// 6. deterministic validation-arming guard: the real-cua check above only
+// fails when the live response happens to violate cua's schema (it is
+// content-dependent — drag/scroll envelopes do, list_windows sometimes
+// doesn't). This fixture backend ALWAYS violates its declared outputSchema,
+// covering both lazily-armed SDK checks: schema-invalid structuredContent
+// (-32602) and missing structuredContent on a schema-declaring tool (-32600,
+// which fires on a merely truthy cached validator — the reason the hub's
+// getValidator returns undefined). Any reintroduction of output validation
+// fails here reliably.
+{
+  const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "schema-violating-backend.mjs");
+  const t2 = new StdioClientTransport({
+    command: "node",
+    args: [SERVER],
+    env: { ...process.env, DESKTOP_HUB_CUA_BIN: FIXTURE },
+  });
+  const c2 = new Client({ name: "smoke-fixture", version: "0" });
+  try {
+    await c2.connect(t2);
+    // The guard is meaningless unless arming actually happened — the hub wraps
+    // internal failures (fixture spawn, listTools throw) into isError results.
+    const arm = await c2.callTool({ name: "desk_describe", arguments: { server: "cua" } });
+    check("fixture desk_describe arms validation", !arm.isError, textOf(arm).slice(0, 160));
+    const dv = await c2.callTool({ name: "desk_call", arguments: { server: "cua", tool: "list_windows", args: {} } });
+    check("schema-violating structuredContent passes through post-listTools (-32602 guard)", !dv.isError && textOf(dv).includes("violating-ok"), textOf(dv).slice(0, 160));
+    const dv2 = await c2.callTool({ name: "desk_call", arguments: { server: "cua", tool: "content_only", args: {} } });
+    check("missing structuredContent passes through post-listTools (-32600 guard)", !dv2.isError && textOf(dv2).includes("content-only-ok"), textOf(dv2).slice(0, 160));
+  } catch (e) {
+    check("fixture guard block ran without protocol errors", false, String(e).slice(0, 160));
+  } finally {
+    await c2.close().catch(() => {});
+  }
+}
+
+// 7. optional oss backend
 if (process.env.DESKTOP_HUB_TEST_OSS === "1") {
   const dc = await client.callTool({ name: "desk_call", arguments: { server: "oss", tool: "list_running_apps", args: {} } }, undefined, { timeout: 180_000 });
   check("desk_call oss list_running_apps", !dc.isError, textOf(dc).slice(0, 120));
@@ -90,7 +132,7 @@ if (process.env.DESKTOP_HUB_TEST_OSS === "1") {
   console.log("skip oss backend (set DESKTOP_HUB_TEST_OSS=1 to include)");
 }
 
-// 6. clean shutdown: closing our side must reap OUR server AND its backends.
+// 8. clean shutdown: closing our side must reap OUR server AND its backends.
 // Check by pid, not by pgrep name-match — other MCP hosts (live Claude Code
 // sessions) legitimately run their own desktop-hub instances concurrently.
 await client.close();

@@ -18,19 +18,29 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import { spawn } from "node:child_process";
-import Ajv from "ajv";
-import addFormats from "ajv-formats";
 
 const CALL_TIMEOUT_MS = 180_000;
 
-// cua's outputSchemas use nonstandard formats (uint64/uint32/double); the
-// SDK's default Ajv logs ~50 "unknown format ignored" warnings per listTools,
-// polluting the host's MCP log. Same config as the SDK default, logger off.
-const quietAjv = new Ajv({ strict: false, validateFormats: true, validateSchema: false, allErrors: true, logger: false });
-addFormats(quietAjv);
-const quietValidator = new AjvJsonSchemaValidator(quietAjv);
+// The hub is a pass-through proxy: backend results must reach the host
+// verbatim even when a backend violates its own declared outputSchema.
+// cua-driver 0.20.0 does exactly that (several tools omit declared envelope
+// fields like effect/route/status), and the SDK client arms outputSchema
+// validation lazily — only after listTools() caches the schemas. With a real
+// validator every cua tool works until the first desk_describe, then every
+// call throws -32602 — AFTER the upstream action already executed, the worst
+// failure mode for automation (success misreported as failure). Skipping
+// output validation entirely defuses that; it also avoids Ajv's ~50
+// unknown-format warnings per listTools from cua's uint64/uint32 schemas.
+// getValidator must return undefined, NOT an always-valid function: the SDK
+// gates a SECOND check ("has an output schema but did not return structured
+// content" → -32600) on the cached validator being truthy, and that check
+// runs before the validator is ever invoked. Both SDK consumers of the cache
+// (callTool and the experimental tasks path) guard with `if (validator)`, so
+// a cached undefined disarms both branches.
+const passthroughValidator = {
+  getValidator: () => undefined,
+};
 
 // ---------------------------------------------------------------------------
 // Downstream backends, spawned lazily and kept alive. On transport close the
@@ -76,7 +86,7 @@ function getClient(name) {
         // Default 10MB read cap kills the connection on big base64 screenshots.
         maxBufferSize: 256 * 1024 * 1024,
       });
-      const client = new Client({ name: "desktop-hub", version: "0.1.0" }, { jsonSchemaValidator: quietValidator });
+      const client = new Client({ name: "desktop-hub", version: "0.1.1" }, { jsonSchemaValidator: passthroughValidator });
       liveTransports.add(transport);
       let errTail = "";
       // Without setEncoding, string+Buffer concat splits multibyte UTF-8 at
@@ -312,7 +322,7 @@ const TOOLS = [
   },
   {
     name: "window_state",
-    description: "AX-tree walk of one window (via cua get_window_state): returns actionable elements (each with element_index + element_token) AND a grounding screenshot. Refresh after UI changes; element handles go stale.",
+    description: "AX-tree walk of one window (via cua get_window_state): returns actionable elements (each with element_index + element_token) AND a grounding screenshot. Refresh after UI changes; element handles go stale. The screenshot can lag the live frame — re-verify critical UI via desktop_screenshot.",
     inputSchema: {
       type: "object",
       properties: {
@@ -330,7 +340,7 @@ const TOOLS = [
     description:
       "Perform one desktop action (via cua; background delivery by default — no cursor/focus steal). Actions: click, double_click, right_click, type (insert text), key (single key e.g. return/tab/escape), hotkey (combo e.g. [\"cmd\",\"c\"]), scroll, drag, set_value (text field/dropdown direct set), menu (invoke exact app-menu path). " +
       TARGET_NOTE +
-      " Per-action params: type→text; key→key(+modifiers); hotkey→keys; scroll→direction(+amount,by); drag→x,y (from) + to_x,to_y; set_value→pid,value; menu→pid,window_id,path. pid is REQUIRED for double_click, right_click, set_value, menu (element_token alone insufficient; scope:'desktop' unsupported for these — desktop double-click = action:'click' with extra:{count:2}). scroll: pass element_token or x,y to wheel-scroll that spot (required for inner/nested scrollers); pid-only scroll instead sends arrow/PageDown keys to the focused control.",
+      " Per-action params: type→text; key→key(+modifiers); hotkey→keys; scroll→direction(+amount,by); drag→x,y (from) + to_x,to_y; set_value→pid,value; menu→pid,window_id,path. pid is REQUIRED for double_click, right_click, set_value, menu (element_token alone insufficient; scope:'desktop' unsupported for these — desktop double-click = action:'click' with extra:{count:2}). scroll: pass element_token or x,y to wheel-scroll that spot (required for inner/nested scrollers); pid-only scroll instead sends arrow/PageDown keys to the focused control. iPad-ported (Designed-for-iPad) apps ignore synthetic scroll/drag/long-press entirely — the only working fallback is desk_call into oss pointer tools (HID-level; moves the real cursor); run_script can't help (no AppleScript dictionary, and System Events has no scroll/drag primitives).",
     inputSchema: {
       type: "object",
       properties: {
@@ -499,7 +509,7 @@ function firstSentence(s) {
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "desktop-hub", version: "0.1.0" },
+  { name: "desktop-hub", version: "0.1.1" },
   {
     capabilities: { tools: {} },
     instructions:
