@@ -2,7 +2,7 @@
 
 **A compact facade MCP server for macOS desktop automation.** It exposes just 10 hand-written tools (~2.3k tokens of definitions) and lazily proxies to two full-featured computer-use MCP servers — [cua-driver](https://github.com/trycua/cua) (56 tools, ~37k tokens) and [computer-use-mcp](https://github.com/zavora-ai/computer-use-mcp) (64 tools, ~21k tokens) — plus native `osascript`. You keep the entire 120-tool surface, but your context window pays ~2k tokens instead of ~58k.
 
-[中文说明在下方](#中文说明) · Works with Claude Code and any MCP client.
+[中文说明在下方](#中文说明) · [Gitee mirror 国内镜像](https://gitee.com/zty552252kevin/desktop-hub) · Works with Claude Code and any MCP client.
 
 ## Why
 
@@ -56,6 +56,8 @@ cd desktop-hub
 npm ci        # not `npm install` — the code relies on SDK 1.30.0 internals pinned in the lockfile
 claude mcp add desktop-hub -s user -- node "$(pwd)/server.mjs"   # path must be absolute
 ```
+
+Mainland China mirror (kept in sync): `git clone https://gitee.com/zty552252kevin/desktop-hub.git`
 
 Only if you previously registered `cua-driver` or `computer-use-mcp` as standalone MCP servers: disable those entries (e.g. `disabledMcpServers` in `~/.claude.json`) so this hub takes over. Fresh installs skip this step.
 
@@ -116,6 +118,8 @@ cd desktop-hub
 npm ci
 claude mcp add desktop-hub -s user -- node "$(pwd)/server.mjs"   # 必须绝对路径
 ```
+
+国内镜像（同步更新，免翻墙）：`git clone https://gitee.com/zty552252kevin/desktop-hub.git`
 
 权限：给 **CuaDriver.app** 授予「辅助功能」+「屏幕录制」（推荐 `cua-driver permissions grant` 让弹窗归属到 App 身份，升级不掉权限）；oss 后端跟随宿主终端的 TCC 身份，终端也要授同样两项；`run_script` 首次对每个目标 App 会弹一次「自动化」授权。
 
