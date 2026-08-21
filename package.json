@@ -2,15 +2,31 @@
   "name": "desktop-hub",
   "version": "0.1.0",
   "description": "Compact facade MCP server aggregating cua-driver + computer-use-oss + osascript",
-  "main": "index.js",
   "scripts": {
     "test": "node test/smoke.mjs"
   },
-  "keywords": [],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "computer-use",
+    "desktop-automation",
+    "macos",
+    "claude-code",
+    "facade",
+    "token-efficiency"
+  ],
   "type": "module",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zty552252kevin-code/desktop-hub.git"
   }
 }
