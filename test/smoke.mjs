@@ -2,7 +2,8 @@
 // Regression smoke test for desktop-hub. Run: npm test
 // Covers: tool surface + token budget, facade validation fast-fails, cua
 // backend round-trip, run_script, output-validation passthrough (real cua +
-// deterministic fixture), clean shutdown (no orphans).
+// deterministic fixture), session auto-revive (deterministic fixture), clean
+// shutdown (no orphans).
 // Set DESKTOP_HUB_TEST_OSS=1 to also exercise the oss backend (slow npx spawn).
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -124,7 +125,52 @@ check("cua tools survive desk_describe (-32602 defused)", !lw2.isError && textOf
   }
 }
 
-// 7. optional oss backend
+// 7. session auto-revive: cua rejects every call on an idle-expired lifecycle
+// session (action NOT executed). The hub must revive + retry exactly once,
+// append an actionable correction to the misleading upstream hint on
+// cross-transport revival failures, refuse to blind-retry rejections it did
+// not itself receive (embedded/quoted rejections, generic errors), and never
+// echo "not executed" once a retry has actually been dispatched.
+{
+  const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "session-expiry-backend.mjs");
+  const t3 = new StdioClientTransport({
+    command: "node",
+    args: [SERVER],
+    env: { ...process.env, DESKTOP_HUB_CUA_BIN: FIXTURE },
+  });
+  const c3 = new Client({ name: "smoke-revive", version: "0" });
+  try {
+    await c3.connect(t3);
+    const ok = await c3.callTool({ name: "desk_call", arguments: { server: "cua", tool: "expires_once", args: {} } });
+    check("expired session auto-revived + retried", !ok.isError && textOf(ok).includes("revive-retry-ok"), textOf(ok).slice(0, 160));
+    check("auto-revive success carries staleness note", textOf(ok).includes("auto-revived"), textOf(ok).slice(0, 200));
+    check("structuredContent survives the staleness note", ok.structuredContent?.elements?.[0]?.element_token === "tok-1", JSON.stringify(ok.structuredContent ?? null).slice(0, 120));
+    const q = await c3.callTool({ name: "desk_call", arguments: { server: "cua", tool: "quoted_name", args: {} } });
+    check("session label with apostrophe still revives", !q.isError && textOf(q).includes("quoted-retry-ok"), textOf(q).slice(0, 200));
+    const loop = await c3.callTool({ name: "desk_call", arguments: { server: "cua", tool: "always_ended", args: {} } });
+    check("revive retries exactly once (no loop)", loop.isError && textOf(loop).includes("sess-b-call-2") && !textOf(loop).includes("sess-b-call-3"), textOf(loop).slice(0, 200));
+    const named = await c3.callTool({ name: "desk_call", arguments: { server: "cua", tool: "unrevivable", args: {} } });
+    check("cross-transport revive failure keeps original error + actionable hint", named.isError && textOf(named).includes("has ended") && textOf(named).includes("NEW session label"), textOf(named).slice(0, 260));
+    const gen = await c3.callTool({ name: "desk_call", arguments: { server: "cua", tool: "generic_error", args: {} } });
+    check("generic cua error passes through untouched (no spurious revive)", gen.isError && textOf(gen).includes("call 1") && !textOf(gen).includes("[desktop-hub]"), textOf(gen).slice(0, 160));
+    const emb = await c3.callTool({ name: "desk_call", arguments: { server: "cua", tool: "embedded_rejection", args: {} } });
+    check("quoted inner rejection does NOT re-run the outer call", emb.isError && textOf(emb).includes("call 1") && !textOf(emb).includes("[desktop-hub]"), textOf(emb).slice(0, 200));
+    const ws = await c3.callTool({ name: "window_state", arguments: { pid: 1, window_id: 2, max_elements: 50, max_depth: 5, include_screenshot: false } });
+    check("window_state passes max_elements/max_depth through", !ws.isError && textOf(ws).includes('"max_elements":50') && textOf(ws).includes('"max_depth":5'), textOf(ws).slice(0, 200));
+    // Crash scenarios LAST — each kills the fixture (auto-respawned with
+    // fresh state on the next call, exercising the throw paths).
+    const rc = await c3.callTool({ name: "desk_call", arguments: { server: "cua", tool: "revive_crash", args: {} } }, undefined, { timeout: 60_000 });
+    check("revive-throw keeps original not-executed error + note", rc.isError && textOf(rc).includes("has ended") && textOf(rc).includes("failed to complete"), textOf(rc).slice(0, 220));
+    const rc2 = await c3.callTool({ name: "desk_call", arguments: { server: "cua", tool: "retry_crash", args: {} } }, undefined, { timeout: 60_000 });
+    check("retry-throw reports outcome UNKNOWN, never 'not executed'", rc2.isError && textOf(rc2).includes("Outcome UNKNOWN") && !textOf(rc2).includes("was rejected"), textOf(rc2).slice(0, 220));
+  } catch (e) {
+    check("session-revive fixture block ran without protocol errors", false, String(e).slice(0, 160));
+  } finally {
+    await c3.close().catch(() => {});
+  }
+}
+
+// 8. optional oss backend
 if (process.env.DESKTOP_HUB_TEST_OSS === "1") {
   const dc = await client.callTool({ name: "desk_call", arguments: { server: "oss", tool: "list_running_apps", args: {} } }, undefined, { timeout: 180_000 });
   check("desk_call oss list_running_apps", !dc.isError, textOf(dc).slice(0, 120));
@@ -132,7 +178,7 @@ if (process.env.DESKTOP_HUB_TEST_OSS === "1") {
   console.log("skip oss backend (set DESKTOP_HUB_TEST_OSS=1 to include)");
 }
 
-// 8. clean shutdown: closing our side must reap OUR server AND its backends.
+// 9. clean shutdown: closing our side must reap OUR server AND its backends.
 // Check by pid, not by pgrep name-match — other MCP hosts (live Claude Code
 // sessions) legitimately run their own desktop-hub instances concurrently.
 await client.close();

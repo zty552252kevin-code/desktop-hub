@@ -86,7 +86,7 @@ function getClient(name) {
         // Default 10MB read cap kills the connection on big base64 screenshots.
         maxBufferSize: 256 * 1024 * 1024,
       });
-      const client = new Client({ name: "desktop-hub", version: "0.1.1" }, { jsonSchemaValidator: passthroughValidator });
+      const client = new Client({ name: "desktop-hub", version: "0.1.2" }, { jsonSchemaValidator: passthroughValidator });
       liveTransports.add(transport);
       let errTail = "";
       // Without setEncoding, string+Buffer concat splits multibyte UTF-8 at
@@ -122,7 +122,7 @@ function getClient(name) {
   return clients[name];
 }
 
-async function backendCall(backend, tool, args, signal) {
+async function rawBackendCall(backend, tool, args, signal) {
   const entry = getClient(backend);
   const client = await entry;
   try {
@@ -139,6 +139,71 @@ async function backendCall(backend, tool, args, signal) {
     }
     throw err;
   }
+}
+
+// cua rejects any call whose lifecycle session has idle-expired with a fixed
+// "…has ended…" error naming the rejected tool; the action is NOT executed
+// ("was rejected"), so one start_session (idempotent upstream) + one retry is
+// safe and replaces the 2-3 call recovery dance the model would otherwise
+// perform. The retry is not itself revive-eligible, so a re-expiry just
+// surfaces. Lazy groups: session labels are free-form and may contain quotes.
+const SESSION_ENDED_RE = /session '(.+?)' has ended; tool call '(.+?)' was rejected/;
+
+function resultText(res) {
+  return (res?.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+}
+
+function withNote(result, note) {
+  return { ...result, content: [...(result.content ?? []), { type: "text", text: note }] };
+}
+
+async function backendCall(backend, tool, args, signal) {
+  const result = await rawBackendCall(backend, tool, args, signal);
+  if (backend !== "cua" || tool === "start_session" || !result?.isError) return result;
+  const m = SESSION_ENDED_RE.exec(resultText(result));
+  // The not-executed premise only holds when the rejection is of THIS call:
+  // an isError result that merely QUOTES an inner rejection (e.g.
+  // replay_trajectory reporting a failed inner turn) names a different tool,
+  // and blindly re-running the outer call would double-execute whatever side
+  // effects it already had.
+  if (!m || m[2] !== tool) return result;
+  const ended = m[1];
+  let revive;
+  try {
+    revive = await rawBackendCall("cua", "start_session", { session: ended }, signal);
+  } catch (err) {
+    // Revive died (timeout/abort/backend crash) — the original rejection
+    // stands and the action still never ran; report both.
+    return withNote(result, `[desktop-hub] auto-revive attempt failed to complete: ${err?.message ?? err}`);
+  }
+  if (revive.isError) {
+    const why = resultText(revive).slice(0, 300);
+    // Only the cross-transport case is a dead end (a name minted on a prior
+    // hub/backend process can never be revived here, despite upstream's
+    // "revive it" hint); other start_session failures may be transient.
+    const hint = /not available to this transport/.test(why)
+      ? ` This name was minted on a previous hub/backend process and cannot be revived here (ignore the "revive it" hint above) — use a NEW session label, or omit session.`
+      : "";
+    return withNote(result, `[desktop-hub] auto-revive of session '${ended}' failed: ${why}.${hint}`);
+  }
+  let retried;
+  try {
+    retried = await rawBackendCall(backend, tool, args, signal);
+  } catch (err) {
+    // The retry was dispatched to a LIVE session — unlike the original
+    // rejection it may have executed before dying. Never echo the original
+    // "not executed" text here; the honest answer is outcome-unknown.
+    return textResult(
+      `[desktop-hub] session '${ended}' had expired; auto-revived it and retried '${tool}', but the retry failed to complete: ${err?.message ?? err}. Outcome UNKNOWN — the action may have executed; re-observe (window_state / desktop_screenshot) before re-issuing.`,
+      true
+    );
+  }
+  if (retried?.isError) return retried;
+  return withNote(
+    retried,
+    `[desktop-hub] session '${ended}' had expired; auto-revived it and retried this call (result above is the retry). ` +
+      `element_tokens/snapshot_ids minted before the expiry may be stale — re-run window_state before element-indexed actions.`
+  );
 }
 
 async function backendTools(backend) {
@@ -322,7 +387,7 @@ const TOOLS = [
   },
   {
     name: "window_state",
-    description: "AX-tree walk of one window (via cua get_window_state): returns actionable elements (each with element_index + element_token) AND a grounding screenshot. Refresh after UI changes; element handles go stale. The screenshot can lag the live frame — re-verify critical UI via desktop_screenshot.",
+    description: "AX-tree walk of one window (via cua get_window_state): returns actionable elements (each with element_index + element_token) AND a grounding screenshot. Refresh after UI changes; element handles go stale. The screenshot can lag the live frame — re-verify critical UI via desktop_screenshot. Huge web/Electron trees can blow up output — bound with query and/or max_elements/max_depth.",
     inputSchema: {
       type: "object",
       properties: {
@@ -330,6 +395,8 @@ const TOOLS = [
         window_id: { type: "integer", description: "From list_windows." },
         query: { type: "string", description: "Case-insensitive filter on elements (cheap way to find a button)." },
         include_screenshot: { type: "boolean", description: "Default true; false = tree only (cheaper)." },
+        max_elements: { type: "integer", minimum: 1, description: "Cap AX nodes walked (default 2000); element_index values unchanged." },
+        max_depth: { type: "integer", minimum: 1, description: "Cap AX-tree depth (default 25)." },
         session: { type: "string" },
       },
       required: ["pid", "window_id"],
@@ -459,7 +526,7 @@ async function handleCall(name, input, signal) {
     case "launch_app":
       return backendCall("cua", "launch_app", pick(input, ["bundle_id", "name", "urls"]), signal);
     case "window_state":
-      return backendCall("cua", "get_window_state", pick(input, ["pid", "window_id", "query", "include_screenshot", "session"]), signal);
+      return backendCall("cua", "get_window_state", pick(input, ["pid", "window_id", "query", "include_screenshot", "max_elements", "max_depth", "session"]), signal);
     case "act": {
       const { tool, args } = buildActArgs(input);
       return backendCall("cua", tool, args, signal);
@@ -509,7 +576,7 @@ function firstSentence(s) {
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "desktop-hub", version: "0.1.1" },
+  { name: "desktop-hub", version: "0.1.2" },
   {
     capabilities: { tools: {} },
     instructions:

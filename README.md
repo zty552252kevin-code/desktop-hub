@@ -64,7 +64,7 @@ Only if you previously registered `cua-driver` or `computer-use-mcp` as standalo
 ### Verify
 
 ```bash
-npm test                        # 23 checks; spawns the real driver and runs osascript on your desktop
+npm test                        # 34 checks; spawns the real driver and runs osascript on your desktop
 DESKTOP_HUB_TEST_OSS=1 npm test # +1 check: also exercises the oss backend (slow first npx spawn, needs network)
 ```
 
@@ -90,6 +90,8 @@ The suite requires cua-driver installed with permissions granted — failures wi
 - SwiftUI apps (e.g. Calculator) may embed invisible characters (U+200E) in display values — `verify`'s `value_equals` then returns `unknown`; use `label_contains` or read the `window_state` markdown instead.
 - iPad-ported apps ("Designed for iPad", e.g. rednote/小红书) are a blind spot for synthetic input: background-posted scroll/drag and synthetic long-press gestures are ignored entirely (transport reports success, nothing happens). The only working fallback is `desk_call` into the oss backend's pointer tools (HID-level — but they move the real cursor); `run_script` can't produce these gestures either (iPad ports expose no AppleScript dictionary, and System Events has no scroll/drag/long-press primitives).
 - `window_state`'s grounding screenshot can lag the live frame. For verification that must be current, take a fresh `desktop_screenshot` (or use native `screencapture`) instead of trusting the bundled image.
+- Expired cua lifecycle sessions are auto-revived: cua rejects every call on an idle-expired session (the action is **not** executed), which used to cost the model a 2-3 call recovery dance. The hub revives (`start_session`, idempotent) and retries once, appending a note that pre-expiry `element_token`s may be stale. Guardrails, each earned in adversarial review: the rejection must name the exact tool just called (an error that merely *quotes* an inner rejection — e.g. a replay tool reporting a failed step — must not trigger a blind re-run of an outer call that already had side effects); if the retry itself dies mid-flight, the hub reports **outcome UNKNOWN** instead of echoing the original "not executed" text (the retry went to a live session and may have landed). One case genuinely can't be revived — a **named** session minted by a previous hub/backend process ("session is not available to this transport"); upstream's error still suggests reviving, so the hub appends the actionable correction: use a new session label.
+- `window_state` on huge web/Electron trees can return 100KB+ — bound it with `query` and/or `max_elements`/`max_depth` (upstream defaults: 2 000 elements, depth 25).
 - Adversarially reviewed in two multi-agent rounds (21 + 20 reviewers, 28 confirmed defects fixed — round 2 caught two regressions introduced by round-1 fixes). Regression suite in `test/smoke.mjs`.
 
 ## Third-party tools
@@ -128,7 +130,7 @@ claude mcp add desktop-hub -s user -- node "$(pwd)/server.mjs"   # 必须绝对�
 
 此前如果单独注册过 cua/oss 两个 MCP 服务器，把它们 disable 掉由本 hub 接管；全新安装跳过这步。
 
-验证：`npm test`（23 项检查，会真实驱动桌面；`DESKTOP_HUB_TEST_OSS=1` 再加 1 项 oss 后端检查）。环境变量见上方英文表格。
+验证：`npm test`（34 项检查，会真实驱动桌面；`DESKTOP_HUB_TEST_OSS=1` 再加 1 项 oss 后端检查）。环境变量见上方英文表格。
 
 ## 坑（血泪换来的）
 
@@ -142,4 +144,6 @@ claude mcp add desktop-hub -s user -- node "$(pwd)/server.mjs"   # 必须绝对�
 - SwiftUI 应用显示值可能带 U+200E 隐形字符，`verify` 的 `value_equals` 会 unknown，改用 `label_contains`。
 - iPad 移植应用（"专为 iPad 设计"，如小红书）是合成输入的盲区：后台投递的 scroll/drag 和一切合成长按拖拽手势完全免疫（transport 报成功、实际没反应）。唯一有效的兜底是 `desk_call` 调 oss 后端的指针工具（HID 层——但会动真实光标）；`run_script` 也救不了（iPad 移植应用没有 AppleScript 字典，System Events 也没有滚动/拖拽/长按原语）。
 - `window_state` 附带的截图可能是陈旧帧。要求"此刻"准确的核验请另拍 `desktop_screenshot`（或原生 `screencapture`），别只信附带的图。
+- cua 生命周期 session 空闲过期后自动复活：过期 session 上的任何调用都会被 cua 拒绝（动作**未**执行），过去要靠模型跳 2-3 个调用的复活舞步；hub 自动 `start_session`（幂等）+ 重试一次，并附注过期前的 `element_token` 可能已失效。两道护栏（都是对抗评审换来的）：错误必须点名**本次调用的工具**才触发（只是*引用*了内层拒绝的错误——如回放类工具报告某步失败——绝不能盲目重跑已有副作用的外层调用）；重试自身半路挂掉时，hub 报告**结果未知**而不是回显原始的"未执行"文本（重试发到的是活 session，可能已经落地）。唯一救不回的场景：**具名** session 跨 hub/后端进程复活必失败（"session is not available to this transport"），而上游错误文本仍在误导性地建议 revive——hub 会在原错误后追加可行动的更正：换一个新 session 标签。
+- `window_state` 在大型网页/Electron 树上可能返回 100KB+——用 `query` 和/或 `max_elements`/`max_depth` 兜住（上游默认 2000 元素、25 层）。
 - 经两轮多 agent 对抗评审（21+20 个审查员）累计修复 28 项确认缺陷（第二轮抓出第一轮两个修复自身引入的回归）。
