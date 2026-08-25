@@ -30,7 +30,7 @@ const serverPid = transport.pid ?? transport._process?.pid;
 
 // 1. Tool surface + token budget
 const { tools } = await client.listTools();
-check("10 facade tools", tools.length === 10, `got ${tools.length}`);
+check("11 facade tools", tools.length === 11, `got ${tools.length}`);
 const defTokens = Math.round(JSON.stringify(tools).length / 4);
 check("tool defs under 3k tokens", defTokens < 3000, `~${defTokens}`);
 
@@ -236,6 +236,98 @@ check("cua tools survive desk_describe (-32602 defused)", !lw2.isError && textOf
     check("window_state diff fixture block ran without protocol errors", false, String(e).slice(0, 160));
   } finally {
     await c4.close().catch(() => {});
+  }
+}
+
+// 7.6 act_batch: deterministic action-recording fixture. Covers the happy
+// path (fresh-token find injection, execution order, facade keys never leak
+// upstream, observe appendix), atomic pre-validation (bad step N = zero
+// upstream actions), ambiguous-find hard fail with candidates, find.nth,
+// if_present skip-and-continue, find-miss failure, truncated-tree absence
+// unprovable, mid-batch failure stopping the remainder, and find on
+// non-element actions being rejected.
+{
+  const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "act-batch-backend.mjs");
+  const t5 = new StdioClientTransport({
+    command: "node",
+    args: [SERVER],
+    env: { ...process.env, DESKTOP_HUB_CUA_BIN: FIXTURE },
+  });
+  const c5 = new Client({ name: "smoke-batch", version: "0" });
+  try {
+    await c5.connect(t5);
+    const batch = (args) => c5.callTool({ name: "act_batch", arguments: args });
+    const logNow = async () => JSON.parse(textOf(await c5.callTool({ name: "desk_call", arguments: { server: "cua", tool: "get_actions_log", args: {} } })));
+
+    const h = await batch({
+      pid: 1,
+      window_id: 2,
+      steps: [
+        { action: "click", find: { role: "AXButton", label: "ok" } },
+        { action: "type", text: "hi", wait_ms: 10 },
+        { action: "key", key: "return" },
+      ],
+      observe: true,
+    });
+    const ht = textOf(h);
+    check("batch happy path all ok", !h.isError && ht.includes("all 3 steps done — 3 ok, 0 skipped"), ht.slice(0, 200));
+    check("batch find injects fresh token", ht.includes("find → sb1:1"), ht.slice(0, 300));
+    check("batch observe appends window_state", ht.includes("baseline established"), ht.slice(-200));
+    let lg = await logNow();
+    check(
+      "batch executes in order with clean upstream args",
+      lg.length === 3 && lg[0].tool === "click" && lg[0].args.element_token === "sb1:1" &&
+        lg[1].tool === "type_text" && lg[1].args.text === "hi" && lg[2].tool === "press_key" &&
+        lg.every((e) => e.args.find === undefined && e.args.if_present === undefined && e.args.wait_ms === undefined),
+      JSON.stringify(lg).slice(0, 300)
+    );
+
+    const v = await batch({ pid: 1, window_id: 2, steps: [{ action: "click", find: { label: "OK" } }, { action: "type" }] });
+    check("batch atomic validation blocks all steps", v.isError && textOf(v).includes("step 2 invalid (nothing executed)"), textOf(v).slice(0, 160));
+    check("batch invalid → zero upstream actions", (await logNow()).length === 3);
+
+    const a = await batch({ pid: 1, window_id: 2, steps: [{ action: "click", find: { label: "Dup" } }] });
+    check("ambiguous find hard-fails with candidates", a.isError && textOf(a).includes("2 elements match") && textOf(a).includes("[4]") && textOf(a).includes("nth"), textOf(a).slice(0, 300));
+
+    const n2 = await batch({ pid: 1, window_id: 2, steps: [{ action: "click", find: { label: "Dup", nth: 1 } }] });
+    lg = await logNow();
+    check("find.nth picks the right duplicate", !n2.isError && lg[lg.length - 1].args.element_token?.endsWith(":5"), JSON.stringify(lg[lg.length - 1] ?? null));
+
+    const p = await batch({ pid: 1, window_id: 2, steps: [{ action: "click", find: { label: "Nope" }, if_present: true }, { action: "key", key: "escape" }] });
+    const pt = textOf(p);
+    check("if_present absent skips and continues", !p.isError && pt.includes("skipped (if_present") && pt.includes("step 2 key: ok") && pt.includes("1 ok, 1 skipped"), pt.slice(0, 300));
+
+    const m = await batch({ pid: 1, window_id: 2, steps: [{ action: "click", find: { label: "Nope" } }] });
+    check("find miss without if_present fails", m.isError && textOf(m).includes("no element matches"), textOf(m).slice(0, 200));
+
+    const tr = await batch({ pid: 1, window_id: 2, session: "trunc", steps: [{ action: "click", find: { label: "Nope" }, if_present: true }] });
+    const trt = textOf(tr);
+    check("if_present miss on incomplete tree skips with caveat", !tr.isError && trt.includes("skipped (if_present") && trt.includes("absence unproven"), trt.slice(0, 260));
+
+    const tr2 = await batch({ pid: 1, window_id: 2, session: "trunc", steps: [{ action: "click", find: { label: "Nope" } }] });
+    check("required find miss on incomplete tree says INCOMPLETE", tr2.isError && textOf(tr2).includes("INCOMPLETE") && textOf(tr2).includes("absence unproven"), textOf(tr2).slice(0, 260));
+
+    const before = (await logNow()).length;
+    const f = await batch({
+      pid: 1,
+      window_id: 2,
+      steps: [
+        { action: "click", find: { label: "Cancel" } },
+        { action: "set_value", value: "boom", find: { role: "AXTextField" } },
+        { action: "click", find: { label: "OK" } },
+      ],
+    });
+    const ftxt = textOf(f);
+    lg = await logNow();
+    check("mid-batch failure stops the rest", f.isError && ftxt.includes("FAILED at step 2") && ftxt.includes("1 not run") && ftxt.includes("DID execute"), ftxt.slice(0, 300));
+    check("failed batch really stopped upstream", lg.length === before + 2 && lg[lg.length - 1].tool === "set_value", `${lg.length - before} actions after failure point`);
+
+    const u = await batch({ pid: 1, window_id: 2, steps: [{ action: "menu", path: ["File"], find: { label: "x" } }] });
+    check("find rejected for non-element action", u.isError && textOf(u).includes('not supported for action "menu"'), textOf(u).slice(0, 160));
+  } catch (e) {
+    check("act_batch fixture block ran without protocol errors", false, String(e).slice(0, 160));
+  } finally {
+    await c5.close().catch(() => {});
   }
 }
 

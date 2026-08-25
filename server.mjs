@@ -641,6 +641,28 @@ const TOOLS = [
     },
   },
   {
+    name: "act_batch",
+    description:
+      "Run up to 8 act steps sequentially in ONE call (params per step = same as act, minus per-call chatter). A step may declare find:{role?,label?,value?,nth?} — the hub re-walks the window's AX tree right before that step and injects a fresh element_token (exact role, case-insensitive SUBSTRING on label/value; ambiguous match without nth = hard error listing candidates; no match = error, or skipped when if_present:true — a skip on an incomplete tree (elements_complete:false, chronic on real windows) carries an absence-unproven caveat). Top-level pid/window_id/session/delivery_mode merge into every step. wait_ms (≤10000) pauses after a step for UI settle. Every step is validated before ANY executes; execution stops at the first failure — steps before it DID run, so re-observe before re-issuing. observe:true appends a window_state diff of (pid, window_id) after the batch; or pass an object of window_state params. Whole batch shares a 50s wall budget. Use plain act for one-off actions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        steps: {
+          type: "array",
+          minItems: 1,
+          maxItems: 8,
+          items: { type: "object", description: "act params (action required) + optional find/{if_present,wait_ms}." },
+        },
+        pid: { type: "integer" },
+        window_id: { type: "integer" },
+        session: { type: "string" },
+        delivery_mode: { type: "string", enum: ["background", "foreground"] },
+        observe: { description: "true, or a window_state params object." },
+      },
+      required: ["steps"],
+    },
+  },
+  {
     name: "verify",
     description:
       "Deterministically verify predicates against one window (via cua verify_state) — use after acting instead of trusting transport success. expect items (ANDed, 1-8): {window:{exists:true}} | {window:{bounds:{x,y,width,height,tolerance_px}}} | {element:{selector:{role?,label_contains?}, exists:true, value_equals?, enabled?, selected?}}. Results: satisfied/unsatisfied/unknown (unknown ≠ success).",
@@ -718,6 +740,229 @@ function textResult(text, isError = false) {
   return { content: [{ type: "text", text }], isError };
 }
 
+async function handleWindowState(input, signal) {
+  const upstream = pick(input, ["pid", "window_id", "query", "include_screenshot", "max_elements", "max_depth", "session"]);
+  const wantDiff = input.diff === true;
+  // Screenshots are the real token cost of an observation loop; in diff
+  // mode they default OFF (explicit include_screenshot:true still wins).
+  if (wantDiff && upstream.include_screenshot === undefined) upstream.include_screenshot = false;
+  const result = await backendCall("cua", "get_window_state", upstream, signal);
+  const parsed = parseWindowState(result);
+  if (!parsed) return result; // error/unparseable: passthrough, baseline untouched
+  if (parsed.degraded) {
+    // Never baseline a degraded tree; keep any healthy baseline so the
+    // next good observation still diffs against the pre-degraded state.
+    return wantDiff ? withNote(result, "[diff] degraded/ax-unresolved tree — full result returned; existing baseline kept.") : result;
+  }
+  const key = diffCacheKey(input);
+  const prev = wantDiff ? diffCache.get(key) : undefined;
+  rememberBaseline(key, snapshotOf(parsed)); // every model-visible healthy tree moves the baseline
+  if (!wantDiff) return result;
+  if (!prev) return withNote(result, "[diff] baseline established for this window — the next diff:true call returns only changes.");
+  const diffText = renderWindowDiff(prev, diffCache.get(key), { pid: input.pid, window_id: input.window_id });
+  if (diffText == null) return withNote(result, "[diff] >50% of elements changed — full tree returned (baseline updated).");
+  if (diffText.length >= resultText(result).length * 0.7) return withNote(result, "[diff] delta not smaller than the full tree — full tree returned.");
+  const images = (result.content ?? []).filter((c) => c.type === "image");
+  return { content: [{ type: "text", text: diffText }, ...images] };
+}
+
+// ---------------------------------------------------------------------------
+// act_batch: run up to 8 act steps in one MCP round-trip. The expensive part
+// of a GUI sequence is not the actions but the model round-trips between
+// them; a declarative batch collapses "click, type, press return" into one
+// call. Each step may carry find:{role,label,value,nth} — the hub re-walks
+// the AX tree immediately before that step and injects a FRESH element_token,
+// sidestepping the per-snapshot token death that makes pre-planned batches
+// impossible for the model itself. Matching is exact-role + case-insensitive
+// SUBSTRING on label/value (never regex — model-supplied patterns on a
+// single-threaded server are a ReDoS vector). Discipline: validate every
+// step before executing any; stop at the first failure; an ambiguous find is
+// a hard error (guessing clicks the wrong control). A find-miss on an
+// incomplete tree (elements_complete:false) can't prove absence — but live
+// probing shows cua reports incomplete on essentially every real window
+// (Terminal 169/169, Edge 324/324 elements, both `false` even at
+// max_elements:10000 — chronic, not cap-related), so treating it as an error
+// would kill if_present exactly where it's needed. Instead: if_present skips
+// with an explicit absence-unproven caveat; a required find still fails, with
+// wording that doesn't pretend a bigger cap would fix it.
+// ---------------------------------------------------------------------------
+
+const BATCH_BUDGET_MS = 50_000;
+const BATCH_STEP_WAIT_CAP_MS = 10_000;
+
+// AbortSignal.any is Node ≥20.3; engines allows 18 — compose by hand. The
+// timer keeps one shared deadline for the whole batch.
+function scopedSignal(signal, ms, why) {
+  const ctrl = new AbortController();
+  const onAbort = () => ctrl.abort(signal.reason);
+  if (signal?.aborted) ctrl.abort(signal.reason);
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => ctrl.abort(new Error(why)), ms);
+  return {
+    signal: ctrl.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+function matchFind(elements, find) {
+  const role = find.role !== undefined ? String(find.role).toLowerCase() : undefined;
+  const label = find.label !== undefined ? String(find.label).toLowerCase() : undefined;
+  const value = find.value !== undefined ? String(find.value).toLowerCase() : undefined;
+  return elements.filter((e) => {
+    if (role !== undefined && String(e.role ?? "").toLowerCase() !== role) return false;
+    if (label !== undefined && !String(e.label ?? "").toLowerCase().includes(label)) return false;
+    if (value !== undefined && !String(e.value ?? "").toLowerCase().includes(value)) return false;
+    return true;
+  });
+}
+
+function fmtFind(f) {
+  return JSON.stringify(pick(f, ["role", "label", "value", "nth"]));
+}
+
+async function actBatch(input, signal) {
+  const steps = input.steps;
+  if (!Array.isArray(steps) || steps.length < 1 || steps.length > 8) {
+    return textResult("act_batch requires steps: an array of 1-8 act steps", true);
+  }
+  const defaults = pick(input, ["pid", "window_id", "session", "delivery_mode"]);
+  // Atomic pre-validation: NOTHING executes unless every step parses. A batch
+  // that dies on step 4's typo after steps 1-3 already clicked is the worst
+  // outcome — half-mutated UI plus an error message.
+  const prepared = [];
+  for (let i = 0; i < steps.length; i++) {
+    const s = { ...defaults, ...steps[i] };
+    try {
+      if (s.if_present && !s.find) throw new Error("if_present requires find");
+      if (s.find) {
+        if (typeof s.find !== "object" || (s.find.role === undefined && s.find.label === undefined && s.find.value === undefined)) {
+          throw new Error("find needs at least one of role/label/value");
+        }
+        if (s.find.nth !== undefined && (!Number.isInteger(s.find.nth) || s.find.nth < 0)) throw new Error("find.nth must be an integer ≥ 0");
+        if (!ACTIONS[s.action]?.map?.element_token) throw new Error(`find is not supported for action "${s.action}" (no element targeting upstream)`);
+        if (s.pid === undefined || s.window_id === undefined) throw new Error("find needs pid + window_id (top-level or per-step)");
+        buildActArgs({ ...s, element_token: "pending" }); // validates action + required params
+      } else {
+        buildActArgs(s);
+      }
+      if (s.wait_ms !== undefined && (!Number.isInteger(s.wait_ms) || s.wait_ms < 0 || s.wait_ms > BATCH_STEP_WAIT_CAP_MS)) {
+        throw new Error(`wait_ms must be an integer 0-${BATCH_STEP_WAIT_CAP_MS}`);
+      }
+      prepared.push(s);
+    } catch (err) {
+      return textResult(`act_batch step ${i + 1} invalid (nothing executed): ${err?.message ?? err}`, true);
+    }
+  }
+
+  const deadline = Date.now() + BATCH_BUDGET_MS;
+  const lines = [];
+  let ok = 0;
+  let skipped = 0;
+  let failedAt = 0;
+  for (let i = 0; i < prepared.length; i++) {
+    const s = prepared[i];
+    const label = `step ${i + 1} ${s.action}`;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      lines.push(`${label}: NOT RUN — ${BATCH_BUDGET_MS / 1000}s batch budget exhausted`);
+      failedAt = i + 1;
+      break;
+    }
+    const scoped = scopedSignal(signal, remaining, `act_batch ${BATCH_BUDGET_MS / 1000}s budget exhausted during ${label}`);
+    try {
+      let exec = s;
+      if (s.find) {
+        // Fresh walk right before the step: element_tokens die per snapshot,
+        // and the previous step may have changed the tree anyway.
+        const wsArgs = { pid: s.pid, window_id: s.window_id, include_screenshot: false };
+        if (s.session !== undefined) wsArgs.session = s.session;
+        const wsRes = await backendCall("cua", "get_window_state", wsArgs, scoped.signal);
+        const parsed = parseWindowState(wsRes);
+        if (!parsed) throw new Error(`find: window_state failed: ${resultText(wsRes).slice(0, 200)}`);
+        if (parsed.degraded) throw new Error(`find: AX tree degraded (${parsed.degraded_reason ?? "unknown"}) — cannot locate elements`);
+        const cands = matchFind(parsed.elements, s.find);
+        if (!cands.length) {
+          const incomplete = parsed.elements_complete === false;
+          if (s.if_present) {
+            lines.push(`${label}: skipped (if_present, ${fmtFind(s.find)} absent${incomplete ? " — caveat: walked tree incomplete, absence unproven" : ""})`);
+            skipped++;
+            continue;
+          }
+          throw new Error(
+            incomplete
+              ? `find: no match for ${fmtFind(s.find)} and the walked tree is INCOMPLETE (elements_complete:false) — absence unproven; the element may sit in an unwalked subtree. Ground with window_state (try query:${JSON.stringify(String(s.find.label ?? s.find.value ?? s.find.role))}) and target via element_token.`
+              : `find: no element matches ${fmtFind(s.find)} (${parsed.elements.length} elements searched)`
+          );
+        }
+        let chosen;
+        if (s.find.nth !== undefined) {
+          chosen = cands[s.find.nth];
+          if (!chosen) throw new Error(`find: nth=${s.find.nth} out of range (${cands.length} matches)`);
+        } else if (cands.length > 1) {
+          const list = cands
+            .slice(0, 6)
+            .map((e) => `[${e.element_index}] ${e.role}${e.label !== undefined ? ` ${JSON.stringify(String(e.label).slice(0, 40))}` : ""}`)
+            .join(", ");
+          throw new Error(`find: ${cands.length} elements match ${fmtFind(s.find)} — add nth or tighten the find. Candidates: ${list}${cands.length > 6 ? ", …" : ""}`);
+        } else {
+          chosen = cands[0];
+        }
+        exec = { ...s, element_token: chosen.element_token };
+        // The fresh token is the target; stale coordinates/indices from the
+        // model's plan must not ride along and win upstream.
+        delete exec.x;
+        delete exec.y;
+        delete exec.element_index;
+        delete exec.snapshot_id;
+      }
+      const { tool, args } = buildActArgs(exec); // facade-only keys (find/if_present/wait_ms) are unmapped → dropped
+      const res = await backendCall("cua", tool, args, scoped.signal);
+      if (res?.isError) throw new Error(resultText(res).slice(0, 300) || "upstream error");
+      lines.push(`${label}: ok${s.find ? ` (find → ${exec.element_token})` : ""}`);
+      ok++;
+    } catch (err) {
+      lines.push(`${label}: FAILED — ${err?.message ?? err}`);
+      failedAt = i + 1;
+      break;
+    } finally {
+      scoped.cleanup();
+    }
+    if (s.wait_ms) await new Promise((r) => setTimeout(r, Math.min(s.wait_ms, Math.max(0, deadline - Date.now()))));
+  }
+
+  const notRun = prepared.length - ok - skipped - (failedAt ? 1 : 0);
+  const head = failedAt
+    ? `[act_batch] FAILED at step ${failedAt} — ${ok} ok, ${skipped} skipped, ${notRun} not run. Steps before the failure DID execute — re-observe (window_state) before re-issuing.`
+    : `[act_batch] all ${prepared.length} steps done — ${ok} ok, ${skipped} skipped.`;
+
+  let observeContent = [];
+  if (input.observe) {
+    const oArgs =
+      typeof input.observe === "object"
+        ? { pid: input.pid, window_id: input.window_id, ...input.observe }
+        : { pid: input.pid, window_id: input.window_id, diff: true };
+    if (oArgs.pid === undefined || oArgs.window_id === undefined) {
+      lines.push("observe: skipped — needs pid + window_id");
+    } else {
+      // Floor of 10s so a budget-exhausted batch can still report final state.
+      const scoped = scopedSignal(signal, Math.max(deadline - Date.now(), 10_000), "act_batch observe timed out");
+      try {
+        const oRes = await handleWindowState(oArgs, scoped.signal);
+        observeContent = oRes.content ?? [];
+        if (oRes.isError) lines.push("observe: window_state errored (see below)");
+      } catch (err) {
+        lines.push(`observe: failed — ${err?.message ?? err}`);
+      } finally {
+        scoped.cleanup();
+      }
+    }
+  }
+  return { content: [{ type: "text", text: [head, ...lines].join("\n") }, ...observeContent], isError: !!failedAt };
+}
+
 async function handleCall(name, input, signal) {
   switch (name) {
     case "desktop_screenshot":
@@ -726,35 +971,14 @@ async function handleCall(name, input, signal) {
       return backendCall("cua", "list_windows", pick(input, ["pid", "on_screen_only"]), signal);
     case "launch_app":
       return backendCall("cua", "launch_app", pick(input, ["bundle_id", "name", "urls"]), signal);
-    case "window_state": {
-      const upstream = pick(input, ["pid", "window_id", "query", "include_screenshot", "max_elements", "max_depth", "session"]);
-      const wantDiff = input.diff === true;
-      // Screenshots are the real token cost of an observation loop; in diff
-      // mode they default OFF (explicit include_screenshot:true still wins).
-      if (wantDiff && upstream.include_screenshot === undefined) upstream.include_screenshot = false;
-      const result = await backendCall("cua", "get_window_state", upstream, signal);
-      const parsed = parseWindowState(result);
-      if (!parsed) return result; // error/unparseable: passthrough, baseline untouched
-      if (parsed.degraded) {
-        // Never baseline a degraded tree; keep any healthy baseline so the
-        // next good observation still diffs against the pre-degraded state.
-        return wantDiff ? withNote(result, "[diff] degraded/ax-unresolved tree — full result returned; existing baseline kept.") : result;
-      }
-      const key = diffCacheKey(input);
-      const prev = wantDiff ? diffCache.get(key) : undefined;
-      rememberBaseline(key, snapshotOf(parsed)); // every model-visible healthy tree moves the baseline
-      if (!wantDiff) return result;
-      if (!prev) return withNote(result, "[diff] baseline established for this window — the next diff:true call returns only changes.");
-      const diffText = renderWindowDiff(prev, diffCache.get(key), { pid: input.pid, window_id: input.window_id });
-      if (diffText == null) return withNote(result, "[diff] >50% of elements changed — full tree returned (baseline updated).");
-      if (diffText.length >= resultText(result).length * 0.7) return withNote(result, "[diff] delta not smaller than the full tree — full tree returned.");
-      const images = (result.content ?? []).filter((c) => c.type === "image");
-      return { content: [{ type: "text", text: diffText }, ...images] };
-    }
+    case "window_state":
+      return handleWindowState(input, signal);
     case "act": {
       const { tool, args } = buildActArgs(input);
       return backendCall("cua", tool, args, signal);
     }
+    case "act_batch":
+      return actBatch(input, signal);
     case "verify": {
       const a = pick(input, ["pid", "window_id", "expect", "timeout_ms", "include_screenshot", "session"]);
       // Upstream rejects (not clamps) out-of-range AND non-integer timeout_ms.

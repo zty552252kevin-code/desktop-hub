@@ -1,6 +1,6 @@
 # desktop-hub
 
-**A compact facade MCP server for macOS desktop automation.** It exposes just 10 hand-written tools (~2.3k tokens of definitions) and lazily proxies to two full-featured computer-use MCP servers — [cua-driver](https://github.com/trycua/cua) (56 tools, ~37k tokens) and [computer-use-mcp](https://github.com/zavora-ai/computer-use-mcp) (64 tools, ~21k tokens) — plus native `osascript`. You keep the entire 120-tool surface, but your context window pays ~2k tokens instead of ~58k.
+**A compact facade MCP server for macOS desktop automation.** It exposes just 11 hand-written tools (~2.8k tokens of definitions) and lazily proxies to two full-featured computer-use MCP servers — [cua-driver](https://github.com/trycua/cua) (56 tools, ~37k tokens) and [computer-use-mcp](https://github.com/zavora-ai/computer-use-mcp) (64 tools, ~21k tokens) — plus native `osascript`. You keep the entire 120-tool surface, but your context window pays ~2k tokens instead of ~58k.
 
 [中文说明在下方](#中文说明) · [Gitee mirror 国内镜像](https://gitee.com/zty552252kevin/desktop-hub) · Works with Claude Code and any MCP client.
 
@@ -9,7 +9,7 @@
 Registering both upstream servers directly costs ~58k context tokens per session just for tool definitions, while the high-frequency surface is small. This facade keeps the hot path cheap and the long tail reachable:
 
 ```
-MCP client ──stdio──> desktop-hub (this server, 10 compact tools)
+MCP client ──stdio──> desktop-hub (this server, 11 compact tools)
                         ├─ lazy stdio child ──> cua-driver mcp        (background desktop control, no cursor/focus steal)
                         ├─ lazy stdio child ──> computer-use-mcp      (AX tree, find_element, fill_form, Spaces…; spawned on first use)
                         └─ local osascript                            (AppleScript/JXA, true background scripting)
@@ -24,6 +24,7 @@ MCP client ──stdio──> desktop-hub (this server, 10 compact tools)
 | `launch_app` | Launch an app in the background without stealing focus (→ cua) |
 | `window_state` | AX-tree walk + grounding screenshot; elements carry `element_token` (→ cua). `diff:true` returns only changes vs your previous call on the same window — a busy tree drops from kBs to a few lines in observation loops |
 | `act` | Ten actions in one: click / double_click / right_click / type / key / hotkey / scroll / drag / set_value / menu (→ mapped to cua tools) |
+| `act_batch` | Up to 8 act steps in ONE round-trip; a step's `find:{role,label,value,nth}` re-walks the AX tree right before it and injects a fresh `element_token` — collapses "click, type, press return" into one call |
 | `verify` | Deterministic assertions on window/element state after acting (→ cua `verify_state`) |
 | `zoom` | Cropped close-up of a window region for small text (→ cua) |
 | `run_script` | AppleScript/JXA via local `osascript` — no backend involved |
@@ -64,7 +65,7 @@ Only if you previously registered `cua-driver` or `computer-use-mcp` as standalo
 ### Verify
 
 ```bash
-npm test                        # 34 checks; spawns the real driver and runs osascript on your desktop
+npm test                        # 68 checks; spawns the real driver and runs osascript on your desktop
 DESKTOP_HUB_TEST_OSS=1 npm test # +1 check: also exercises the oss backend (slow first npx spawn, needs network)
 ```
 
@@ -93,6 +94,7 @@ The suite requires cua-driver installed with permissions granted — failures wi
 - Expired cua lifecycle sessions are auto-revived: cua rejects every call on an idle-expired session (the action is **not** executed), which used to cost the model a 2-3 call recovery dance. The hub revives (`start_session`, idempotent) and retries once, appending a note that pre-expiry `element_token`s may be stale. Guardrails, each earned in adversarial review: the rejection must name the exact tool just called (an error that merely *quotes* an inner rejection — e.g. a replay tool reporting a failed step — must not trigger a blind re-run of an outer call that already had side effects); if the retry itself dies mid-flight, the hub reports **outcome UNKNOWN** instead of echoing the original "not executed" text (the retry went to a live session and may have landed). One case genuinely can't be revived — a **named** session minted by a previous hub/backend process ("session is not available to this transport"); upstream's error still suggests reviving, so the hub appends the actionable correction: use a new session label.
 - `window_state` on huge web/Electron trees can return 100KB+ — bound it with `query` and/or `max_elements`/`max_depth` (upstream defaults: 2 000 elements, depth 25).
 - `window_state` `diff:true` keeps a server-side baseline per (pid, window_id, query, caps; last 8 windows) — the first call returns the full tree; degraded trees and >50% churn fall back to full automatically. If the previous tree has been compacted out of your context, call once without `diff` to re-ground (the server can't know what you still remember). Static text and text-area values live only in `tree_markdown`, so the diff appends an `md+` line hint for them.
+- `act_batch` semantics, each choice deliberate: every step is validated before ANY executes (a batch dying on step 4's typo after steps 1-3 clicked is the worst outcome); execution stops at the first failure and the summary says so — steps before it DID run, so re-observe before re-issuing. `find` matching is exact role + case-insensitive **substring** on label/value — never regex (model-supplied patterns on a single-threaded server are a ReDoS vector). An ambiguous find without `nth` is a hard error listing candidates (guessing clicks the wrong control). A find-miss on an incomplete tree deserves special care: live probing shows cua reports `elements_complete:false` on essentially every real window (Terminal and Edge both stay `false` even at `max_elements:10000` — chronic, not cap-related), so `if_present` skips with an explicit absence-unproven caveat instead of erroring, while a required find still fails with wording that doesn't pretend a bigger cap would fix it.
 - Adversarially reviewed in two multi-agent rounds (21 + 20 reviewers, 28 confirmed defects fixed — round 2 caught two regressions introduced by round-1 fixes). Regression suite in `test/smoke.mjs`.
 
 ## Third-party tools
@@ -112,7 +114,7 @@ desktop-hub is a facade that **launches two independently developed tools as sep
 
 # 中文说明
 
-macOS 桌面自动化的**精简聚合 MCP 服务器**：用 ~2.3k token 的 10 个工具定义，替代 cua-driver（56 工具 ~37k token）+ computer-use-mcp（64 工具 ~21k token）合计 ~58k token 的上下文占用，120 个底层工具一个不少（长尾经 `desk_call` 直达、schema 用 `desk_describe` 按需取）。
+macOS 桌面自动化的**精简聚合 MCP 服务器**：用 ~2.8k token 的 11 个工具定义，替代 cua-driver（56 工具 ~37k token）+ computer-use-mcp（64 工具 ~21k token）合计 ~58k token 的上下文占用，120 个底层工具一个不少（长尾经 `desk_call` 直达、schema 用 `desk_describe` 按需取）。
 
 ## 安装
 
@@ -131,7 +133,7 @@ claude mcp add desktop-hub -s user -- node "$(pwd)/server.mjs"   # 必须绝对�
 
 此前如果单独注册过 cua/oss 两个 MCP 服务器，把它们 disable 掉由本 hub 接管；全新安装跳过这步。
 
-验证：`npm test`（34 项检查，会真实驱动桌面；`DESKTOP_HUB_TEST_OSS=1` 再加 1 项 oss 后端检查）。环境变量见上方英文表格。
+验证：`npm test`（68 项检查，会真实驱动桌面；`DESKTOP_HUB_TEST_OSS=1` 再加 1 项 oss 后端检查）。环境变量见上方英文表格。
 
 ## 坑（血泪换来的）
 
@@ -148,4 +150,5 @@ claude mcp add desktop-hub -s user -- node "$(pwd)/server.mjs"   # 必须绝对�
 - cua 生命周期 session 空闲过期后自动复活：过期 session 上的任何调用都会被 cua 拒绝（动作**未**执行），过去要靠模型跳 2-3 个调用的复活舞步；hub 自动 `start_session`（幂等）+ 重试一次，并附注过期前的 `element_token` 可能已失效。两道护栏（都是对抗评审换来的）：错误必须点名**本次调用的工具**才触发（只是*引用*了内层拒绝的错误——如回放类工具报告某步失败——绝不能盲目重跑已有副作用的外层调用）；重试自身半路挂掉时，hub 报告**结果未知**而不是回显原始的"未执行"文本（重试发到的是活 session，可能已经落地）。唯一救不回的场景：**具名** session 跨 hub/后端进程复活必失败（"session is not available to this transport"），而上游错误文本仍在误导性地建议 revive——hub 会在原错误后追加可行动的更正：换一个新 session 标签。
 - `window_state` 在大型网页/Electron 树上可能返回 100KB+——用 `query` 和/或 `max_elements`/`max_depth` 兜住（上游默认 2000 元素、25 层）。
 - `window_state` 的 `diff:true` 在服务端按 (pid, window_id, query, 上限参数) 存基线（最近 8 个窗口）——首次调用返回全树；degraded 树和 >50% 大改自动回退全树。若上一棵树已被压缩出你的上下文，先不带 `diff` 调一次重新对齐（服务端不知道你还记得什么）。静态文本/文本区内容只存在于 `tree_markdown`，diff 会附 `md+` 行提示。
+- `act_batch` 的每条语义都是刻意的：所有步骤先全部校验、任何一步不合法则**一个都不执行**（第 4 步笔误、前 3 步已点完是最坏结局）；执行中首个失败即停，且摘要明说"失败前的步骤已经执行了，重新观察再重发"。`find` 匹配 = role 精确 + label/value 大小写不敏感**子串**——绝不用正则（模型供给的 pattern 在单线程服务器上就是 ReDoS 攻击面）。无 `nth` 的多匹配是硬错误并列出候选（瞎猜会点错控件）。不完整树上的 find 落空要特别小心：真机探测发现 cua 在几乎所有真实窗口上都报 `elements_complete:false`（Terminal 和 Edge 把 `max_elements` 提到 10000 依然 false——慢性状态，与截断上限无关），所以 `if_present` 改为带"absence unproven"警示的跳过而非报错；必选 find 落空仍报错，但措辞不再假装调大上限能解决。
 - 经两轮多 agent 对抗评审（21+20 个审查员）累计修复 28 项确认缺陷（第二轮抓出第一轮两个修复自身引入的回归）。
