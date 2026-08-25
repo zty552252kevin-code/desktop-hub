@@ -72,6 +72,10 @@ function evict(name, entry) {
   if (clients[name] === entry) {
     delete clients[name];
     delete toolCatalog[name];
+    // A new cua process is a new snapshot namespace; diffing against a
+    // baseline from the dead process would be content-wise mostly valid but
+    // the conservative move is a fresh full tree on the next diff call.
+    if (name === "cua") diffCache.clear();
   }
 }
 
@@ -86,7 +90,7 @@ function getClient(name) {
         // Default 10MB read cap kills the connection on big base64 screenshots.
         maxBufferSize: 256 * 1024 * 1024,
       });
-      const client = new Client({ name: "desktop-hub", version: "0.1.2" }, { jsonSchemaValidator: passthroughValidator });
+      const client = new Client({ name: "desktop-hub", version: "0.2.0" }, { jsonSchemaValidator: passthroughValidator });
       liveTransports.add(transport);
       let errTail = "";
       // Without setEncoding, string+Buffer concat splits multibyte UTF-8 at
@@ -288,6 +292,202 @@ function buildActArgs(input) {
 }
 
 // ---------------------------------------------------------------------------
+// window_state diff mode: cua's get_window_state re-sends the whole AX tree
+// every call (a busy Electron window is tens of kB), yet inside one
+// automation loop most of it is unchanged between observations. diff:true
+// keeps the last model-visible tree per (pid, window_id, query, caps) and
+// returns only the delta. Identity is content-based — role+label paired by
+// DFS occurrence order — because element_tokens/snapshot_ids are minted fresh
+// per call and element_index shifts on any insertion. Frames are compared
+// window-relative (±1px) so a window move alone doesn't flag every element.
+// Fail-open discipline: any doubt (unparseable result, degraded/ax-unresolved
+// tree, >50% structural churn, diff not actually smaller) returns the full
+// upstream result — this layer compresses, it must never hide state. Only
+// trees the model actually saw move the baseline; degraded responses never do.
+// ---------------------------------------------------------------------------
+
+const DIFF_CACHE_MAX = 8;
+const diffCache = new Map(); // key -> {snapshotId, complete, win, items, mdLines}
+
+function diffCacheKey(i) {
+  // query/max_* change which elements the walk returns; baselining across
+  // different filters would produce phantom adds/removes.
+  return [i.pid, i.window_id, i.query ?? "", i.max_elements ?? "", i.max_depth ?? ""].join("\u0000");
+}
+
+function rememberBaseline(key, snap) {
+  diffCache.delete(key);
+  diffCache.set(key, snap);
+  if (diffCache.size > DIFF_CACHE_MAX) diffCache.delete(diffCache.keys().next().value);
+}
+
+function parseWindowState(result) {
+  if (result?.isError) return null;
+  const sc = result?.structuredContent;
+  if (sc && Array.isArray(sc.elements)) return sc;
+  try {
+    const parsed = JSON.parse(resultText(result));
+    return Array.isArray(parsed?.elements) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function snapshotOf(parsed) {
+  const win = parsed.elements.find((e) => e.depth === 0 && e.role === "AXWindow")?.frame;
+  const items = parsed.elements.map((e) => ({
+    idx: e.element_index,
+    key: `${e.role}\u0000${e.label ?? ""}`,
+    role: e.role,
+    label: e.label,
+    value: e.value === undefined ? undefined : String(e.value),
+    enabled: e.enabled,
+    selected: e.selected,
+    frame: e.frame
+      ? win
+        ? { x: e.frame.x - win.x, y: e.frame.y - win.y, w: e.frame.w, h: e.frame.h }
+        : { x: e.frame.x, y: e.frame.y, w: e.frame.w, h: e.frame.h }
+      : undefined,
+  }));
+  return {
+    snapshotId: parsed.snapshot_id,
+    complete: parsed.elements_complete !== false,
+    win,
+    items,
+    mdLines: typeof parsed.tree_markdown === "string" && parsed.tree_markdown ? parsed.tree_markdown.split("\n") : [],
+  };
+}
+
+function frameEq(a, b) {
+  if (!a || !b) return a === b;
+  return Math.abs(a.x - b.x) <= 1 && Math.abs(a.y - b.y) <= 1 && Math.abs(a.w - b.w) <= 1 && Math.abs(a.h - b.h) <= 1;
+}
+
+function fmtFrame(f) {
+  return f ? `(${f.x},${f.y},${f.w}×${f.h})` : "(no frame)";
+}
+
+function clipVal(v) {
+  v = String(v);
+  return v.length > 200 ? `${v.slice(0, 200)}…[+${v.length - 200} chars]` : v;
+}
+
+function fmtName(it) {
+  const label = it.label !== undefined && it.label !== "" ? ` ${JSON.stringify(String(it.label).slice(0, 80))}` : "";
+  return `${it.role}${label}`;
+}
+
+// Pair k-th occurrence of (role,label) in the baseline with k-th in the new
+// tree. Insertions between identical-key siblings can pair off-by-one — the
+// churn guard catches the pathological versions of that.
+function pairItems(prev, next) {
+  const byKey = new Map();
+  for (const p of prev.items) {
+    let q = byKey.get(p.key);
+    if (!q) byKey.set(p.key, (q = []));
+    q.push(p);
+  }
+  const pairs = [];
+  const added = [];
+  for (const n of next.items) {
+    const q = byKey.get(n.key);
+    if (q && q.length) pairs.push([q.shift(), n]);
+    else added.push(n);
+  }
+  const removed = [...byKey.values()].flat();
+  return { pairs, added, removed };
+}
+
+// Multiset line diff of tree_markdown — the only place non-actionable content
+// (static text, text-area values) lives; elements[] omits it entirely.
+function mdDelta(prevLines, nextLines) {
+  const count = new Map();
+  for (const l of prevLines) count.set(l, (count.get(l) ?? 0) + 1);
+  const addedLines = [];
+  for (const l of nextLines) {
+    const c = count.get(l) ?? 0;
+    if (c > 0) count.set(l, c - 1);
+    else addedLines.push(l);
+  }
+  let removedN = 0;
+  for (const c of count.values()) removedN += c;
+  return { addedLines, removedN };
+}
+
+// Returns the rendered diff text, or null when structural churn exceeds 50%
+// (navigation happened; the delta would be noise — send the full tree).
+function renderWindowDiff(prev, next, meta) {
+  const { pairs, added, removed } = pairItems(prev, next);
+  if (added.length + removed.length > Math.max(prev.items.length, next.items.length, 1) * 0.5) return null;
+
+  const changed = [];
+  for (const [p, n] of pairs) {
+    const d = [];
+    if ((p.value ?? "") !== (n.value ?? "")) d.push(`value ${JSON.stringify(clipVal(p.value ?? ""))}→${JSON.stringify(clipVal(n.value ?? ""))}`);
+    if (!frameEq(p.frame, n.frame)) d.push(`frame ${fmtFrame(p.frame)}→${fmtFrame(n.frame)} (window-relative)`);
+    if (p.enabled !== n.enabled) d.push(`enabled ${p.enabled}→${n.enabled}`);
+    if (p.selected !== n.selected) d.push(`selected ${p.selected}→${n.selected}`);
+    if (d.length) changed.push({ p, n, d });
+  }
+  const { addedLines, removedN } = mdDelta(prev.mdLines, next.mdLines);
+  const winMoved = !frameEq(prev.win, next.win);
+
+  const lines = [];
+  const nChanges = changed.length + added.length + removed.length;
+  if (!nChanges && !addedLines.length && !removedN && !winMoved) {
+    return (
+      `[window_state diff] pid ${meta.pid} win ${meta.window_id}: no changes vs baseline (${next.items.length} elements, indices unchanged). ` +
+      `New snapshot ${next.snapshotId} — element_token is now "${next.snapshotId}:<index>"; earlier tokens are dead. ` +
+      `Lost the baseline tree from context? Call window_state without diff for the full tree.`
+    );
+  }
+  lines.push(
+    `[window_state diff] pid ${meta.pid} win ${meta.window_id} · ${prev.snapshotId}→${next.snapshotId} · ${next.items.length} elements (baseline ${prev.items.length}) · ${nChanges} element change(s)`
+  );
+  lines.push(`element_token for ANY index below = "${next.snapshotId}:<index>"; tokens from earlier snapshots are dead.`);
+  if (!prev.complete || !next.complete) {
+    lines.push("⚠ tree truncated (max_elements/max_depth) on one or both sides — tail adds/removals may be truncation artifacts.");
+  }
+  if (winMoved) lines.push(`~ window frame ${fmtFrame(prev.win)}→${fmtFrame(next.win)} (absolute screen px)`);
+  for (const { p, n, d } of changed) {
+    const movedNote = n.idx !== p.idx ? ` (was [${p.idx}])` : "";
+    lines.push(`~ [${n.idx}] ${fmtName(n)}${movedNote} ${d.join("; ")}`);
+  }
+  for (const n of added) {
+    const bits = [fmtFrame(n.frame)];
+    if (n.value !== undefined && n.value !== "") bits.push(`value ${JSON.stringify(clipVal(n.value))}`);
+    if (n.enabled === false) bits.push("disabled");
+    lines.push(`+ [${n.idx}] ${fmtName(n)} ${bits.join(" ")}`);
+  }
+  for (const p of removed.slice(0, 10)) lines.push(`- [${p.idx}] ${fmtName(p)} (old index)`);
+  if (removed.length > 10) lines.push(`- …+${removed.length - 10} more removed`);
+  // Index-shift runs: surviving-but-unchanged elements whose index moved.
+  // AX order is stable, so an insertion/removal shifts a contiguous suffix;
+  // gap-tolerant merge on equal delta keeps this to one line per shift.
+  const inChanged = new Set(changed.map((c) => c.n));
+  const moved = pairs.filter(([p, n]) => n.idx !== p.idx && !inChanged.has(n)).sort((a, b) => a[1].idx - b[1].idx);
+  const runs = [];
+  for (const [p, n] of moved) {
+    const d = n.idx - p.idx;
+    const last = runs[runs.length - 1];
+    if (last && last.d === d) last.end = n.idx;
+    else runs.push({ start: n.idx, end: n.idx, d });
+  }
+  for (const r of runs) {
+    const span = r.start === r.end ? `[${r.start}]` : `[${r.start}-${r.end}]`;
+    lines.push(`> ${span} unchanged, indices ${r.d > 0 ? "+" : ""}${r.d} vs baseline`);
+  }
+  if (addedLines.length || removedN) {
+    for (const l of addedLines.slice(0, 5)) lines.push(`md+ ${l.trim().slice(0, 160)}`);
+    if (addedLines.length > 5) lines.push(`md+ …+${addedLines.length - 5} more lines`);
+    lines.push(
+      `tree_markdown: +${addedLines.length}/−${removedN} lines vs baseline (static text/text-area content lives only there — call without diff for the full text).`
+    );
+  }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // run_script: native osascript, no backend spawn. Script goes via stdin to
 // avoid argv length limits.
 // ---------------------------------------------------------------------------
@@ -387,16 +587,17 @@ const TOOLS = [
   },
   {
     name: "window_state",
-    description: "AX-tree walk of one window (via cua get_window_state): returns actionable elements (each with element_index + element_token) AND a grounding screenshot. Refresh after UI changes; element handles go stale. The screenshot can lag the live frame — re-verify critical UI via desktop_screenshot. Huge web/Electron trees can blow up output — bound with query and/or max_elements/max_depth.",
+    description: "AX-tree walk of one window (via cua get_window_state): returns actionable elements (each with element_index + element_token) AND a grounding screenshot. Refresh after UI changes; element handles go stale. The screenshot can lag the live frame — re-verify critical UI via desktop_screenshot. Huge web/Electron trees can blow up output — bound with query and/or max_elements/max_depth, or pass diff:true in observation loops.",
     inputSchema: {
       type: "object",
       properties: {
         pid: { type: "integer" },
         window_id: { type: "integer", description: "From list_windows." },
         query: { type: "string", description: "Case-insensitive filter on elements (cheap way to find a button)." },
-        include_screenshot: { type: "boolean", description: "Default true; false = tree only (cheaper)." },
+        include_screenshot: { type: "boolean", description: "Default true (false in diff mode); false = tree only (cheaper)." },
         max_elements: { type: "integer", minimum: 1, description: "Cap AX nodes walked (default 2000); element_index values unchanged." },
         max_depth: { type: "integer", minimum: 1, description: "Cap AX-tree depth (default 25)." },
+        diff: { type: "boolean", description: "Return only changes vs this window's previous window_state (baseline keyed by pid+window_id+query+caps, last 8 windows). First call, big churn, or degraded trees return the full tree. If the previous tree is no longer in your context, call once without diff to re-ground." },
         session: { type: "string" },
       },
       required: ["pid", "window_id"],
@@ -525,8 +726,31 @@ async function handleCall(name, input, signal) {
       return backendCall("cua", "list_windows", pick(input, ["pid", "on_screen_only"]), signal);
     case "launch_app":
       return backendCall("cua", "launch_app", pick(input, ["bundle_id", "name", "urls"]), signal);
-    case "window_state":
-      return backendCall("cua", "get_window_state", pick(input, ["pid", "window_id", "query", "include_screenshot", "max_elements", "max_depth", "session"]), signal);
+    case "window_state": {
+      const upstream = pick(input, ["pid", "window_id", "query", "include_screenshot", "max_elements", "max_depth", "session"]);
+      const wantDiff = input.diff === true;
+      // Screenshots are the real token cost of an observation loop; in diff
+      // mode they default OFF (explicit include_screenshot:true still wins).
+      if (wantDiff && upstream.include_screenshot === undefined) upstream.include_screenshot = false;
+      const result = await backendCall("cua", "get_window_state", upstream, signal);
+      const parsed = parseWindowState(result);
+      if (!parsed) return result; // error/unparseable: passthrough, baseline untouched
+      if (parsed.degraded) {
+        // Never baseline a degraded tree; keep any healthy baseline so the
+        // next good observation still diffs against the pre-degraded state.
+        return wantDiff ? withNote(result, "[diff] degraded/ax-unresolved tree — full result returned; existing baseline kept.") : result;
+      }
+      const key = diffCacheKey(input);
+      const prev = wantDiff ? diffCache.get(key) : undefined;
+      rememberBaseline(key, snapshotOf(parsed)); // every model-visible healthy tree moves the baseline
+      if (!wantDiff) return result;
+      if (!prev) return withNote(result, "[diff] baseline established for this window — the next diff:true call returns only changes.");
+      const diffText = renderWindowDiff(prev, diffCache.get(key), { pid: input.pid, window_id: input.window_id });
+      if (diffText == null) return withNote(result, "[diff] >50% of elements changed — full tree returned (baseline updated).");
+      if (diffText.length >= resultText(result).length * 0.7) return withNote(result, "[diff] delta not smaller than the full tree — full tree returned.");
+      const images = (result.content ?? []).filter((c) => c.type === "image");
+      return { content: [{ type: "text", text: diffText }, ...images] };
+    }
     case "act": {
       const { tool, args } = buildActArgs(input);
       return backendCall("cua", tool, args, signal);
@@ -576,7 +800,7 @@ function firstSentence(s) {
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "desktop-hub", version: "0.1.2" },
+  { name: "desktop-hub", version: "0.2.0" },
   {
     capabilities: { tools: {} },
     instructions:

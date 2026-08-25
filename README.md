@@ -22,7 +22,7 @@ MCP client ──stdio──> desktop-hub (this server, 10 compact tools)
 | `desktop_screenshot` | Full-display screenshot, true screen pixels (→ cua `get_desktop_state`) |
 | `list_windows` | All top-level windows incl. minimized/off-Space (→ cua) |
 | `launch_app` | Launch an app in the background without stealing focus (→ cua) |
-| `window_state` | AX-tree walk + grounding screenshot; elements carry `element_token` (→ cua) |
+| `window_state` | AX-tree walk + grounding screenshot; elements carry `element_token` (→ cua). `diff:true` returns only changes vs your previous call on the same window — a busy tree drops from kBs to a few lines in observation loops |
 | `act` | Ten actions in one: click / double_click / right_click / type / key / hotkey / scroll / drag / set_value / menu (→ mapped to cua tools) |
 | `verify` | Deterministic assertions on window/element state after acting (→ cua `verify_state`) |
 | `zoom` | Cropped close-up of a window region for small text (→ cua) |
@@ -92,6 +92,7 @@ The suite requires cua-driver installed with permissions granted — failures wi
 - `window_state`'s grounding screenshot can lag the live frame. For verification that must be current, take a fresh `desktop_screenshot` (or use native `screencapture`) instead of trusting the bundled image.
 - Expired cua lifecycle sessions are auto-revived: cua rejects every call on an idle-expired session (the action is **not** executed), which used to cost the model a 2-3 call recovery dance. The hub revives (`start_session`, idempotent) and retries once, appending a note that pre-expiry `element_token`s may be stale. Guardrails, each earned in adversarial review: the rejection must name the exact tool just called (an error that merely *quotes* an inner rejection — e.g. a replay tool reporting a failed step — must not trigger a blind re-run of an outer call that already had side effects); if the retry itself dies mid-flight, the hub reports **outcome UNKNOWN** instead of echoing the original "not executed" text (the retry went to a live session and may have landed). One case genuinely can't be revived — a **named** session minted by a previous hub/backend process ("session is not available to this transport"); upstream's error still suggests reviving, so the hub appends the actionable correction: use a new session label.
 - `window_state` on huge web/Electron trees can return 100KB+ — bound it with `query` and/or `max_elements`/`max_depth` (upstream defaults: 2 000 elements, depth 25).
+- `window_state` `diff:true` keeps a server-side baseline per (pid, window_id, query, caps; last 8 windows) — the first call returns the full tree; degraded trees and >50% churn fall back to full automatically. If the previous tree has been compacted out of your context, call once without `diff` to re-ground (the server can't know what you still remember). Static text and text-area values live only in `tree_markdown`, so the diff appends an `md+` line hint for them.
 - Adversarially reviewed in two multi-agent rounds (21 + 20 reviewers, 28 confirmed defects fixed — round 2 caught two regressions introduced by round-1 fixes). Regression suite in `test/smoke.mjs`.
 
 ## Third-party tools
@@ -146,4 +147,5 @@ claude mcp add desktop-hub -s user -- node "$(pwd)/server.mjs"   # 必须绝对�
 - `window_state` 附带的截图可能是陈旧帧。要求"此刻"准确的核验请另拍 `desktop_screenshot`（或原生 `screencapture`），别只信附带的图。
 - cua 生命周期 session 空闲过期后自动复活：过期 session 上的任何调用都会被 cua 拒绝（动作**未**执行），过去要靠模型跳 2-3 个调用的复活舞步；hub 自动 `start_session`（幂等）+ 重试一次，并附注过期前的 `element_token` 可能已失效。两道护栏（都是对抗评审换来的）：错误必须点名**本次调用的工具**才触发（只是*引用*了内层拒绝的错误——如回放类工具报告某步失败——绝不能盲目重跑已有副作用的外层调用）；重试自身半路挂掉时，hub 报告**结果未知**而不是回显原始的"未执行"文本（重试发到的是活 session，可能已经落地）。唯一救不回的场景：**具名** session 跨 hub/后端进程复活必失败（"session is not available to this transport"），而上游错误文本仍在误导性地建议 revive——hub 会在原错误后追加可行动的更正：换一个新 session 标签。
 - `window_state` 在大型网页/Electron 树上可能返回 100KB+——用 `query` 和/或 `max_elements`/`max_depth` 兜住（上游默认 2000 元素、25 层）。
+- `window_state` 的 `diff:true` 在服务端按 (pid, window_id, query, 上限参数) 存基线（最近 8 个窗口）——首次调用返回全树；degraded 树和 >50% 大改自动回退全树。若上一棵树已被压缩出你的上下文，先不带 `diff` 调一次重新对齐（服务端不知道你还记得什么）。静态文本/文本区内容只存在于 `tree_markdown`，diff 会附 `md+` 行提示。
 - 经两轮多 agent 对抗评审（21+20 个审查员）累计修复 28 项确认缺陷（第二轮抓出第一轮两个修复自身引入的回归）。

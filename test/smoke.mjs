@@ -2,8 +2,8 @@
 // Regression smoke test for desktop-hub. Run: npm test
 // Covers: tool surface + token budget, facade validation fast-fails, cua
 // backend round-trip, run_script, output-validation passthrough (real cua +
-// deterministic fixture), session auto-revive (deterministic fixture), clean
-// shutdown (no orphans).
+// deterministic fixture), session auto-revive (deterministic fixture),
+// window_state diff mode (deterministic fixture), clean shutdown (no orphans).
 // Set DESKTOP_HUB_TEST_OSS=1 to also exercise the oss backend (slow npx spawn).
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -167,6 +167,75 @@ check("cua tools survive desk_describe (-32602 defused)", !lw2.isError && textOf
     check("session-revive fixture block ran without protocol errors", false, String(e).slice(0, 160));
   } finally {
     await c3.close().catch(() => {});
+  }
+}
+
+// 7.5 window_state diff mode: deterministic scripted-tree fixture. Covers
+// baseline establishment (+ screenshot default-off upstream), the no-change
+// one-liner, a real delta (value change with index move, insertion, shift-run
+// compression, token-rebase header, tree_markdown hint), cache-key separation
+// by query, degraded trees never moving the baseline, >50% churn fail-open,
+// and plain (non-diff) window_state both staying byte-clean AND moving the
+// baseline.
+{
+  const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "window-state-backend.mjs");
+  const t4 = new StdioClientTransport({
+    command: "node",
+    args: [SERVER],
+    env: { ...process.env, DESKTOP_HUB_CUA_BIN: FIXTURE },
+  });
+  const c4 = new Client({ name: "smoke-diff", version: "0" });
+  try {
+    await c4.connect(t4);
+    const ws = (args) => c4.callTool({ name: "window_state", arguments: { pid: 1, window_id: 2, ...args } });
+
+    const r1 = await ws({ diff: true });
+    const x1 = textOf(r1);
+    check("diff 1st call: full tree + baseline note", !r1.isError && x1.includes("baseline established") && x1.includes('"element_token"'), x1.slice(0, 160));
+    check("diff defaults include_screenshot:false upstream", x1.includes('"received_include_screenshot":false'), x1.slice(0, 200));
+
+    const r2 = await ws({ diff: true });
+    const x2 = textOf(r2);
+    check("diff no-change one-liner", !r2.isError && x2.includes("no changes vs baseline") && x2.includes('"s2:<index>"'), x2.slice(0, 240));
+    check("no-change response is compact (no elements JSON)", !x2.includes('"element_token"') && x2.length < 600, `len=${x2.length}`);
+
+    const r3 = await ws({ diff: true });
+    const x3 = textOf(r3);
+    check("diff header shows snapshot lineage s2→s3", x3.includes("s2→s3"), x3.slice(0, 160));
+    check("diff value change + index move rendered", x3.includes('~ [3] AXTextField "Name" (was [2]) value ""→"kevin"'), x3);
+    check("diff insertion rendered with frame", x3.includes('+ [2] AXButton "Cancel" (80,30,60×20)'), x3);
+    check("diff shift-run compressed", x3.includes("> [4-5] unchanged, indices +1 vs baseline"), x3);
+    check("diff token-rebase header", x3.includes('"s3:<index>"'), x3.slice(0, 400));
+    check("diff tree_markdown hint with added line", x3.includes('md+ - AXStaticText = "hello kevin"') && x3.includes("+1/−1 lines"), x3);
+    check("diff omits unchanged elements", !x3.includes('"element_token"') && !x3.includes('"OK"'), x3);
+
+    const rq = await ws({ diff: true, query: "ok" });
+    check("different query = separate baseline (full tree again)", !rq.isError && textOf(rq).includes("baseline established"), textOf(rq).slice(0, 160));
+
+    const r4 = await ws({ diff: true });
+    const x4 = textOf(r4);
+    check("degraded tree passes through full with note", !r4.isError && x4.includes("degraded/ax-unresolved") && x4.includes('"degraded":true'), x4.slice(0, 200));
+
+    const r5 = await ws({ diff: true });
+    const x5 = textOf(r5);
+    check("degraded did not move baseline (diff is s3→s5)", x5.includes("s3→s5"), x5.slice(0, 160));
+    check("window-relative frame change rendered", x5.includes('~ [4] AXButton "Help" (was [5]) frame (10,130,60×20)→(40,130,60×20)'), x5);
+    check("removal rendered with old index", x5.includes('- [4] AXMenuItem "Quit" (old index)'), x5);
+
+    const r6 = await ws({ diff: true });
+    const x6 = textOf(r6);
+    check("churn >50% falls open to full tree", !r6.isError && x6.includes(">50% of elements changed") && x6.includes('"element_token"'), x6.slice(0, 200));
+
+    const r7 = await ws({});
+    const x7 = textOf(r7);
+    check("plain window_state stays passthrough (no diff notes)", !r7.isError && x7.includes('"element_token"') && !x7.includes("[diff]"), x7.slice(0, 200));
+    const r8 = await ws({ diff: true });
+    const x8 = textOf(r8);
+    check("plain window_state moved the baseline (s7→s8 no changes)", x8.includes("no changes vs baseline") && x8.includes('"s8:<index>"'), x8.slice(0, 240));
+  } catch (e) {
+    check("window_state diff fixture block ran without protocol errors", false, String(e).slice(0, 160));
+  } finally {
+    await c4.close().catch(() => {});
   }
 }
 
