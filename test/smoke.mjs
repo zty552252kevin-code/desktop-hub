@@ -273,6 +273,12 @@ check("cua tools survive desk_describe (-32602 defused)", !lw2.isError && textOf
     check("batch happy path all ok", !h.isError && ht.includes("all 3 steps done — 3 ok, 0 skipped"), ht.slice(0, 200));
     check("batch find injects fresh token", ht.includes("find → sb1:1"), ht.slice(0, 300));
     check("batch observe appends window_state", ht.includes("baseline established"), ht.slice(-200));
+    check("batch step line surfaces cua effect/route", ht.includes("step 1 click: ok (find → sb1:1) · effect=confirmed route=accessibility"), ht.slice(0, 400));
+    check("batch flags abnormal effect + escalation", ht.includes("step 2 type: ok · ⚠ effect=suspected_noop route=synthetic_events escalation=delivery_failed→foreground"), ht.slice(0, 500));
+    check("batch plain-text result keeps bare ok", ht.includes("step 3 key: ok\n") || ht.endsWith("step 3 key: ok"), ht.slice(0, 500));
+    const tl = await c5.listTools();
+    const ws = tl.tools.find((t) => t.name === "window_state"), ab = tl.tools.find((t) => t.name === "act_batch");
+    check("text-first guidance in window_state + act_batch descriptions", /Text-first/.test(ws.description) && /tree-only/.test(ab.description) && /3-6 deterministic steps/.test(ab.description), (ws.description + ab.description).slice(0, 200));
     let lg = await logNow();
     check(
       "batch executes in order with clean upstream args",

@@ -90,7 +90,7 @@ function getClient(name) {
         // Default 10MB read cap kills the connection on big base64 screenshots.
         maxBufferSize: 256 * 1024 * 1024,
       });
-      const client = new Client({ name: "desktop-hub", version: "0.2.0" }, { jsonSchemaValidator: passthroughValidator });
+      const client = new Client({ name: "desktop-hub", version: "0.2.1" }, { jsonSchemaValidator: passthroughValidator });
       liveTransports.add(transport);
       let errTail = "";
       // Without setEncoding, string+Buffer concat splits multibyte UTF-8 at
@@ -587,7 +587,7 @@ const TOOLS = [
   },
   {
     name: "window_state",
-    description: "AX-tree walk of one window (via cua get_window_state): returns actionable elements (each with element_index + element_token) AND a grounding screenshot. Refresh after UI changes; element handles go stale. The screenshot can lag the live frame — re-verify critical UI via desktop_screenshot. Huge web/Electron trees can blow up output — bound with query and/or max_elements/max_depth, or pass diff:true in observation loops.",
+    description: "AX-tree walk of one window (via cua get_window_state): returns actionable elements (each with element_index + element_token) and, unless include_screenshot:false, a grounding screenshot. Text-first: in observation loops use diff:true (tree-only) or include_screenshot:false — every image costs the model a vision turn; take the screenshot as a checkpoint when the tree is incomplete, shows no delta, or before an irreversible action. Element handles go stale after UI changes. The screenshot can lag the live frame — re-verify critical UI via desktop_screenshot. Huge web/Electron trees can blow up output — bound with query and/or max_elements/max_depth.",
     inputSchema: {
       type: "object",
       properties: {
@@ -643,7 +643,7 @@ const TOOLS = [
   {
     name: "act_batch",
     description:
-      "Run up to 8 act steps sequentially in ONE call (params per step = same as act, minus per-call chatter). A step may declare find:{role?,label?,value?,nth?} — the hub re-walks the window's AX tree right before that step and injects a fresh element_token (exact role, case-insensitive SUBSTRING on label/value; ambiguous match without nth = hard error listing candidates; no match = error, or skipped when if_present:true — a skip on an incomplete tree (elements_complete:false, chronic on real windows) carries an absence-unproven caveat). Top-level pid/window_id/session/delivery_mode merge into every step. wait_ms (≤10000) pauses after a step for UI settle. Every step is validated before ANY executes; execution stops at the first failure — steps before it DID run, so re-observe before re-issuing. observe:true appends a window_state diff of (pid, window_id) after the batch; or pass an object of window_state params. Whole batch shares a 50s wall budget. Use plain act for one-off actions.",
+      "Run up to 8 act steps sequentially in ONE call (params per step = same as act, minus per-call chatter). A step may declare find:{role?,label?,value?,nth?} — the hub re-walks the window's AX tree right before that step and injects a fresh element_token (exact role, case-insensitive SUBSTRING on label/value; ambiguous match without nth = hard error listing candidates; no match = error, or skipped when if_present:true — a skip on an incomplete tree (elements_complete:false, chronic on real windows) carries an absence-unproven caveat). Top-level pid/window_id/session/delivery_mode merge into every step. wait_ms (≤10000) pauses after a step for UI settle. Every step is validated before ANY executes; execution stops at the first failure — steps before it DID run, so re-observe before re-issuing. observe:true appends a tree-only window_state diff of (pid, window_id) after the batch — the cheap default; an object form (window_state params) is accepted, but observe:{include_screenshot:true} costs a vision turn, so use it as a checkpoint, not every batch. Whole batch shares a 50s wall budget. PREFER this over chains of single act calls: put the 3-6 deterministic steps you already know in one batch and observe once; plain act is for a genuine one-off.",
     inputSchema: {
       type: "object",
       properties: {
@@ -823,6 +823,26 @@ function fmtFind(f) {
   return JSON.stringify(pick(f, ["role", "label", "value", "nth"]));
 }
 
+// cua action envelopes carry effect ("confirmed" | "unverifiable" | "suspected_noop" …),
+// route ("accessibility" | "synthetic_events") and, when background delivery fell
+// back, an escalation. A bare "ok" hid a suspected no-op click while the batch kept
+// typing into whatever had focus — surface the envelope, flag anything that is not
+// the two normal outcomes.
+function actionEffect(res) {
+  let sc = res?.structuredContent;
+  if (!sc || typeof sc !== "object") {
+    try { sc = JSON.parse(resultText(res)); } catch { return ""; }
+  }
+  if (!sc || typeof sc !== "object") return "";
+  const parts = [];
+  if (sc.effect !== undefined) parts.push(`effect=${sc.effect}`);
+  if (sc.route !== undefined) parts.push(`route=${sc.route}`);
+  if (sc.escalation && typeof sc.escalation === "object") parts.push(`escalation=${sc.escalation.reason ?? "?"}→${sc.escalation.target ?? "?"}`);
+  if (!parts.length) return "";
+  const abnormal = !!sc.escalation || (sc.effect !== undefined && !["confirmed", "unverifiable"].includes(String(sc.effect)));
+  return ` · ${abnormal ? "⚠ " : ""}${parts.join(" ")}`;
+}
+
 async function actBatch(input, signal) {
   const steps = input.steps;
   if (!Array.isArray(steps) || steps.length < 1 || steps.length > 8) {
@@ -921,7 +941,7 @@ async function actBatch(input, signal) {
       const { tool, args } = buildActArgs(exec); // facade-only keys (find/if_present/wait_ms) are unmapped → dropped
       const res = await backendCall("cua", tool, args, scoped.signal);
       if (res?.isError) throw new Error(resultText(res).slice(0, 300) || "upstream error");
-      lines.push(`${label}: ok${s.find ? ` (find → ${exec.element_token})` : ""}`);
+      lines.push(`${label}: ok${s.find ? ` (find → ${exec.element_token})` : ""}${actionEffect(res)}`);
       ok++;
     } catch (err) {
       lines.push(`${label}: FAILED — ${err?.message ?? err}`);
@@ -1024,7 +1044,7 @@ function firstSentence(s) {
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "desktop-hub", version: "0.2.0" },
+  { name: "desktop-hub", version: "0.2.1" },
   {
     capabilities: { tools: {} },
     instructions:
@@ -1032,6 +1052,9 @@ const server = new Server(
       "Prefer app APIs/CLI/Bash for non-GUI outcomes and Playwright for web pages. Scriptable app → run_script first. " +
       "GUI workflow: launch_app → list_windows → window_state(pid, window_id) → act with element_token → verify. " +
       "Never advance on transport success alone — verify or re-observe. " +
+      "Observation is TEXT-FIRST: the AX tree from window_state (diff:true inside loops) is the primary sense. Every image in a result costs the model a full vision turn plus far more reasoning than text, so request screenshots (include_screenshot:true, zoom, desktop_screenshot) only as checkpoints — when the tree is incomplete or shows no delta after an action, on iPad-ported/canvas/WebView windows, or right before an irreversible action. " +
+      "Batch: plan 3-6 deterministic steps in ONE act_batch (find + observe:true = tree-only diff) instead of act → window_state → act; never re-observe without an intervening action. " +
+      "After a context compaction or resume, the first window_state per window must be a full (non-diff) call, and no element_token quoted in a summary may be reused. " +
       "Full 120-tool surface of both underlying servers reachable via desk_call; schemas via desk_describe.",
   }
 );

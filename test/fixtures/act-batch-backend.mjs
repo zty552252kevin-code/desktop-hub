@@ -74,6 +74,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (name === "set_value" && args.value === "boom") {
         return { isError: true, content: [{ type: "text", text: "set_value exploded" }] };
       }
+      // Mirror cua's real action envelope: click via structuredContent (normal outcome),
+      // type_text via JSON text only (abnormal outcome → hub must flag it).
+      if (name === "click") {
+        return { content: [{ type: "text", text: `${name}-ok` }], structuredContent: { delivery: { mode: "background" }, effect: "confirmed", route: "accessibility" } };
+      }
+      if (name === "type_text") {
+        return { content: [{ type: "text", text: JSON.stringify({ delivery: { mode: "background" }, effect: "suspected_noop", route: "synthetic_events", escalation: { reason: "delivery_failed", target: "foreground" } }) }] };
+      }
       return { content: [{ type: "text", text: `${name}-ok` }] };
     case "get_actions_log":
       return { content: [{ type: "text", text: JSON.stringify(log) }] };
