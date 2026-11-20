@@ -105,7 +105,7 @@ function getClient(name) {
         // Default 10MB read cap kills the connection on big base64 screenshots.
         maxBufferSize: 256 * 1024 * 1024,
       });
-      const client = new Client({ name: "desktop-hub", version: "0.3.0" }, { jsonSchemaValidator: passthroughValidator });
+      const client = new Client({ name: "desktop-hub", version: "0.3.1" }, { jsonSchemaValidator: passthroughValidator });
       liveTransports.add(transport);
       let errTail = "";
       // Without setEncoding, string+Buffer concat splits multibyte UTF-8 at
@@ -2878,7 +2878,7 @@ function firstSentence(s) {
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "desktop-hub", version: "0.3.0" },
+  { name: "desktop-hub", version: "0.3.1" },
   {
     capabilities: { tools: {} },
     instructions:

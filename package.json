@@ -1,7 +1,7 @@
 {
   "name": "desktop-hub",
-  "version": "0.3.0",
-  "description": "Compact facade MCP server aggregating cua-driver + computer-use-oss + osascript",
+  "version": "0.3.1",
+  "description": "Compact facade MCP server aggregating cua-driver + computer-use-mcp + osascript",
   "scripts": {
     "test": "node test/unit.mjs && node test/smoke.mjs"
   },
