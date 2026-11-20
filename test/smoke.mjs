@@ -942,7 +942,7 @@ const TABLE = (names) => [
       o = await run([{ action: "type", text: "网页" }, { action: "key", key: "return" }], { structured: { effect: "unverifiable", escalation: { reason: "effect_unconfirmed", target: "none" } } });
       check(
         "effect_unconfirmed (web content): no ⚠, batch continues, one closing note",
-        !o.r.isError && o.x === "[act_batch] all 2 steps done — 2 ok, 0 skipped.\nstep 1 type: ok · effect=unverifiable\nstep 2 key: ok\n(web content: cua cannot confirm typed text by read-back there — that is normal, not a failure)" && o.lg.actions.length === 2,
+        !o.r.isError && o.x === "[act_batch] all 2 steps done — 2 ok, 0 skipped.\nstep 1 type: ok · effect=unverifiable\nstep 2 key: ok\n(the driver could not confirm this by reading it back — usual for web content and for keys sent to a window rather than to an element; not a failure in itself: go by the changes listed)" && o.lg.actions.length === 2,
         o.x
       );
       await ctl("fake_next_reply", { structured: { effect: "suspected_noop" } });
@@ -3282,6 +3282,10 @@ const TABLE = (names) => [
       const k = await call("act", { action: "key", ...W, key: "return" });
       let lg = await log();
       check("window_not_key (0.55's answer where 0.28 said same_pid_keyboard_ambiguity), in the driver's own envelope: the hub says what still works, nothing was sent", k.isError === true && /Background input refused \(window_not_key\)/.test(textOf(k)) && /could not make this window the app's key window/.test(textOf(k)) && /not executed/.test(textOf(k)) && lg.actions.length === 0 && lg.calls.some((c) => c.refused === "window_not_key"), textOf(k));
+      await ctl("fake_next_reply", { refusal: { code: "window_not_key", form: "background", message: "invoke_menu: requested window 773 is not the confirmed document menu context (focused=Some(9001), main=Some(9001)); no menu action was dispatched" } });
+      const mn = await call("act", { action: "menu", ...W, path: ["文件", "新建"] });
+      lg = await log();
+      check("a menu sent through a window that is not the app's main one (0.55 refuses it, measured): the hub names the window to send it through, nothing was sent", mn.isError === true && /not executed/.test(textOf(mn)) && /the main one is window 9001/.test(textOf(mn)) && /send the menu with window_id 9001/.test(textOf(mn)) && !/no key was sent/.test(textOf(mn)) && lg.actions.length === 0, textOf(mn));
       await ctl("fake_next_reply", { refusal: { code: "point_outside_window", form: "effect", message: "" } });
       const e = await call("act_batch", { ...W, steps: [{ action: "click", find: { label: "提交" } }, { action: "click", find: { label: "提交" }, again: true }] });
       lg = await log();

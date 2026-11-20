@@ -2445,9 +2445,18 @@ async function runSteps(input, signal, single) {
           );
         }
         if (/window_not_key/.test(t)) {
-          // Later drivers aim keys at one window of a multi-window app by making it the app's key window first;
-          // when that cannot be confirmed they refuse with this code and send nothing.
-          throw new StepError(`${up.trim()} — [desktop-hub] the driver could not make this window the app's key window, so no key was sent. A click into the field first (find, then click) may give it the focus; set_value on a field and menu do not depend on it.`, "none");
+          // Later drivers aim keys — and menus — at one window of a multi-window app through the app's key/main
+          // window; when the addressed window is not it and cannot be made it, they refuse with this code and
+          // send nothing. Measured on 0.55.0 (TextEdit): a menu sent with the id of a window that is not the
+          // main one is refused, and the refusal names the one that is.
+          if (s.action === "menu") {
+            const main = /main=Some\((\d+)\)/.exec(t)?.[1];
+            throw new StepError(
+              `${up.trim()} — [desktop-hub] the driver sends a menu only through the app's main window, and this is not it${main ? ` (the main one is window ${main})` : ""}. A menu item acts on the main window whichever id it is sent with: if that is the window you mean, send the menu with ${main ? `window_id ${main}` : "its window_id (list_windows)"}; if it is not, the item would act on the wrong window — click into this window first.`,
+              "none"
+            );
+          }
+          throw new StepError(`${up.trim()} — [desktop-hub] the driver could not make this window the app's key window, so no key was sent. A click into the field first (find, then click) may give it the focus; set_value on a field does not depend on it.`, "none");
         }
         if (/off_space_or_ax_unresolved|ax_unresolved/.test(t) && Number.isInteger(s.window_id)) {
           const why = await unreachableReason(s, scoped.signal);
@@ -2533,7 +2542,7 @@ async function runSteps(input, signal, single) {
     head = `[${tag}] all ${total} steps done — ${ok} ok, ${skipped} skipped.`;
   }
   if (single && stopAt && stopKind !== "effect") head = ""; // the one step line says it all
-  if (webNote) lines.push("(web content: cua cannot confirm typed text by read-back there — that is normal, not a failure)");
+  if (webNote) lines.push("(the driver could not confirm this by reading it back — usual for web content and for keys sent to a window rather than to an element; not a failure in itself: go by the changes listed)");
 
   const out = [head, ...lines].filter(Boolean);
   let images = [];
