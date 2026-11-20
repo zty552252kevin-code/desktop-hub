@@ -1937,9 +1937,15 @@ function actionEffect(res, s) {
   else if (esc === "delivery_failed" && s.action === "hotkey") advice = ' — the shortcut did not reach the background window; for paste/copy/select-all use action:"menu" with the Edit-menu path';
   else if (esc === "delivery_failed") advice = " — the input did not reach the background window";
   else if (esc === "suspected_noop" || sc.effect === "suspected_noop") advice = " — the press probably did nothing: target the nearest [n] row via find, or look at a screenshot";
+  // What the driver adds in words. A later driver writes a hint and a summary on EVERY action ("The click was
+  // sent but nothing confirmed it. Read what changed before clicking again…", advice to use its own batch tool):
+  // on a routine result that is some 250 characters per step saying what the hub's report below it shows, so
+  // they are passed on only when something is off.
   let hint = "";
-  for (const k of ["hint", "next_call", "summary"]) {
-    if (typeof sc[k] === "string" && sc[k]) hint += ` · ${k}: ${clip(sc[k], 200)}`;
+  if (stop) {
+    for (const k of ["hint", "next_call", "summary"]) {
+      if (typeof sc[k] === "string" && sc[k]) hint += ` · ${k}: ${clip(sc[k], 200)}`;
+    }
   }
   const webNote = esc === "effect_unconfirmed";
   return { text: parts.length ? ` · ${stop ? "⚠ " : ""}${parts.join(" ")}${advice}${hint}` : hint, stop, webNote };
