@@ -13,7 +13,17 @@ await hubcall(A, 'launch_app', { bundle_id: 'com.apple.calculator' }); await new
 const lw = await hubcall(A, 'list_windows', {});
 const m = /^(\d+) pid (\d+) (?:计算器|Calculator) /m.exec(lw); if (!m) { console.log('Calculator window not found', lw); process.exit(1); }
 const W = { pid: Number(m[2]), window_id: Number(m[1]) };
-const gws = async (c, extra = {}) => { const r = await raw(c, 'get_window_state', { ...W, include_screenshot: false, ...extra }); const sc = r.structuredContent; if (!sc?.elements) { console.log('  get_window_state returned no elements:', txt(r).slice(0, 300)); return null; } return sc; };
+// cua >= 0.34 answers with the markdown tree alone unless asked for full_output; an older driver may refuse a
+// parameter it does not list. Ask the plain way first, and remember which this driver needs.
+let fullOutput = false;
+const gws = async (c, extra = {}) => {
+  const once = () => raw(c, 'get_window_state', { ...W, include_screenshot: false, ...(fullOutput ? { full_output: true } : {}), ...extra });
+  let r = await once();
+  if (!fullOutput && !r.isError && !r.structuredContent?.elements && r.structuredContent?.tree_markdown) { fullOutput = true; console.log('  (this driver returns elements only with full_output:true: that one read was made twice, every later one asks that way)'); r = await once(); }
+  const sc = r.structuredContent;
+  if (!sc?.elements) { console.log('  get_window_state returned no elements:', txt(r).slice(0, 300)); return null; }
+  return sc;
+};
 const tok = (sc, label) => sc.elements.find((e) => e.role === 'AXButton' && e.label === label)?.element_token;
 const click = async (c, token, extra = {}) => { const r = await raw(c, 'click', { pid: W.pid, window_id: W.window_id, element_token: token, ...extra }); const t = txt(r) || JSON.stringify(r.structuredContent || {}).slice(0, 300); return (r.isError ? 'ERR ' : 'ok  ') + t.replace(/\s+/g, ' ').slice(0, 200); };
 

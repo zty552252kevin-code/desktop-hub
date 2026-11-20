@@ -1139,5 +1139,143 @@ section("review round 11: names that are not controls, one record or two, lines 
   check("round 11: wrapperOf scans a wrapper once, not once per text in it (4,000 texts in one clickable group)", all && Date.now() - t0 < 500, `${Date.now() - t0} ms`);
 });
 
+// ---------------------------------------------------------------------------
+// cua 0.55: the bracket of a row is made of optional parts, a walk may be cut
+// short by the clock, and the payload says so in fields of its own.
+// ---------------------------------------------------------------------------
+section("cua 0.55 rows", () => {
+  const ROWS = [
+    [0, "AXWindow", "新版窗", { a: ["AXRaise"] }],
+    [1, "AXGroup", null, { ix: false, help: "向左滑动归档" }],
+    [1, "AXButton", "保存", { press: true, en: false }],
+    [1, "AXButton", "通过 [草稿]", { press: true, id: "ok", help: '批准 "本单"', ca: ["置顶", "归档 [全部]"] }],
+    [1, "AXCheckBox", "记住", { en: false, a: [] }],
+    [1, "AXButton", null, { press: true, en: false, help: '无标签 "图标" [actions=[x]] 说明', ca: ["置顶"] }],
+    [1, "AXStaticText", "尾巴 [help=\"不是提示\"]", { a: [] }],
+    [1, "AXStaticText", "末行 [enabled=false]", { ix: false }],
+    [1, "AXTextField", "备注", { v: "见 [actions=[press]] 一节", press: true }],
+  ];
+  const sc = payload("s55", ROWS, { grammar: "055" });
+  check(
+    "0.55 fixture: optional bracket parts, in the driver's order",
+    sc.tree_markdown.includes('\n  - AXGroup [help="向左滑动归档"]\n  - [1] AXButton "保存" [enabled=false actions=[press]]\n  - [2] AXButton "通过 [草稿]" [id=ok help="批准 "本单"" actions=[press] custom_actions=["置顶","归档 [全部]"]]\n  - [3] AXCheckBox "记住" [enabled=false]\n') &&
+      sc.elements[1].actions.includes("AXShowMenu"),
+    sc.tree_markdown
+  );
+  for (const [name, t] of [["with elements", parseTree(sc)], ["markdown only", parseTree(payload("s55m", ROWS, { grammar: "055", mode: "md" }))]]) {
+    const byLabel = (l) => t.nodes.find((n) => n.label === l);
+    check(`0.55 rows (${name}): one node per row, none swallowed by a bracket the parser did not know`, t.nodes.length === ROWS.length, `${t.nodes.length}`);
+    check(`0.55 rows (${name}): enabled=false is read, with and without actions after it`, byLabel("保存")?.enabled === false && byLabel("记住")?.enabled === false && byLabel("通过 [草稿]")?.enabled !== false, J([byLabel("保存"), byLabel("记住")]));
+    check(`0.55 rows (${name}): a label that contains a bracket keeps it; press comes from actions, not custom_actions`, byLabel("通过 [草稿]")?.press === true && byLabel("记住")?.press !== true && t.nodes.length === ROWS.length, J(byLabel("通过 [草稿]")));
+    const icon = t.nodes[5];
+    check(`0.55 rows (${name}): an unlabeled control's help keeps its quotes and brackets, between enabled=false and what follows`, icon.role === "AXButton" && !icon.label && icon.help === '无标签 "图标" [actions=[x]] 说明' && icon.enabled === false && icon.press === true, J(icon));
+    const group = t.nodes[1];
+    check(`0.55 rows (${name}): a help-only un-indexed row — help apart, no bracket left in its text`, group.role === "AXGroup" && group.help === "向左滑动归档" && !/\[/.test(group.text ?? ""), J(group));
+    check(`0.55 rows (${name}): text that merely looks like a bracket part stays text`, t.nodes[6].label?.endsWith('[help="不是提示"]') !== false && /末行 \[enabled=false\]/.test(t.nodes[7].text ?? "") && t.nodes[7].enabled !== false, J([t.nodes[6], t.nodes[7]]));
+    check(`0.55 rows (${name}): a value that ends in something bracket-like is still the value`, byLabel("备注")?.value === "见 [actions=[press]] 一节" && byLabel("备注")?.press === true, J(byLabel("备注")));
+    check(`0.55 rows (${name}): rendered — help shown as help=, no raw bracket`, /\n - AXGroup help="向左滑动归档"\n/.test(renderTree(t)) && !/\[help=|\[enabled=|actions=\[/.test(renderTree(t).replace(/"[^"\n]*"/g, '""')), renderTree(t));
+  }
+});
+section("row tails: text that looks like one", () => {
+  // The value of a text area can be anything, source code and copied trees included. Whatever the row's real
+  // tail is, it is the one after the value's closing quote.
+  const piece = (i) => `line ${i} "q" [id=x${i} help="h "y" z" enabled=false actions=[press]] tail`;
+  const cases = {
+    "one tail-looking piece": piece(0),
+    "two pieces, two lines": `${piece(0)}\n${piece(1)}`,
+    "two pieces, one line": `${piece(0)} ${piece(1)}`,
+    "0.28-style tails": 'x "q" [id=a actions=[press]] t\ny "q" [id=b actions=[press]] t',
+    "a quote, then custom_actions": 'see "q" [custom_actions=["Pin"]] here',
+    "ends like a tail": 'copy of "保存" [enabled=false actions=[press]]',
+  };
+  for (const [name, body] of Object.entries(cases)) {
+    for (const g of ["055", undefined]) {
+      const t = parseTree(payload("sv", [[0, "AXWindow", "编辑窗", { a: ["AXRaise"] }], [1, "AXTextArea", "编辑器", { v: body, press: true }], [1, "AXButton", "后", { press: true }]], { mode: "md", grammar: g }));
+      check(`row tails (${name}${g ? ", 0.55" : ""}): the value is whole, the row's own actions are read, the next row is a row`, t.nodes.length === 3 && N(t, 1).value === body && N(t, 1).press === true && N(t, 2).label === "后", J([t.nodes.length, N(t, 1)?.value, N(t, 1)?.press]));
+    }
+  }
+  const big = Array.from({ length: 3000 }, (_, i) => piece(i)).join("\n");
+  const t0 = Date.now();
+  const t = parseTree(payload("sb", [[0, "AXWindow", "编辑窗", { a: ["AXRaise"] }], [1, "AXTextArea", "编辑器", { v: big, press: true }], [1, "AXButton", "后", { press: true }]], { mode: "md", grammar: "055" }));
+  check("row tails: a 200 KB value with 3,000 tail-looking lines parses right, and not in row length × their number", t.nodes.length === 3 && N(t, 1).value === big && N(t, 1).press === true && Date.now() - t0 < 300, `${Date.now() - t0} ms, ${t.nodes.length} nodes`);
+  const h = parseTree(payload("sh", [[0, "AXWindow", "编辑窗", { a: ["AXRaise"] }], [1, "AXButton", null, { press: true, help: 'see [id=3 actions=[x]] and "this" [actions=[y]] too' }], [1, "AXButton", "后", { press: true }]], { mode: "md" }));
+  check("row tails: a help that contains openings of its own is one help (0.28 grammar too)", h.nodes.length === 3 && N(h, 1).help === 'see [id=3 actions=[x]] and "this" [actions=[y]] too' && N(h, 1).press === true, J(N(h, 1)));
+  const sp = parseTree(payload("si", [[0, "AXWindow", "编辑窗", { a: ["AXRaise"] }], [1, "AXButton", "带空格 id", { press: true, id: "q?a=1&b=2 c d" }], [1, "AXButton", "后", { press: true }]], { mode: "md", grammar: "055" }));
+  check("row tails: an id with blanks in it", sp.nodes.length === 3 && N(sp, 1).label === "带空格 id" && N(sp, 1).press === true, J(N(sp, 1)));
+});
+section("row tails: what a driver writes that is not the plain case", () => {
+  const W = [0, "AXWindow", "边界窗", { a: ["AXRaise"] }];
+  const after = [1, "AXStaticText", "下一行", { ix: false }];
+  const end = [1, "AXButton", "收尾", { press: true }];
+  // a 0.28 driver lists custom actions inside actions=[…], and their descriptors run over lines
+  const CUSTOM = "Name:移到废纸篓\nTarget:0x0\nSelector:(null)";
+  for (const mode of ["both", "md"]) {
+    const t = parseTree(payload("sn", [W, [1, "AXButton", "废纸篓", { a: ["AXPress", CUSTOM], id: "tr" }], after, [1, "AXButton", null, { a: ["AXPress", CUSTOM], help: "删除它" }], after, end], { mode }));
+    check(`row tails (0.28 custom action over lines, ${mode}): the tail is cut off, the next rows are rows`, t.nodes.length === 6 && N(t, 1).label === "废纸篓" && N(t, 1).press === true && N(t, 2).help === "删除它" && t.nodes[2].role === "AXStaticText" && t.nodes[4].role === "AXStaticText", J(t.nodes.map((n) => [n.idx, n.role, n.label ?? n.text, n.help])));
+    for (const g of ["055", undefined]) {
+      for (const id of ["user[email]", "grid[2][3]", " lead", "a  b", ""]) {
+        if (g === "055" && !id.trim()) continue; // a later driver leaves out an id that is blank
+        const u = parseTree(payload("si", [W, [1, "AXTextField", "邮箱", { v: "", press: true, id }], after, end], { mode, grammar: g }));
+        check(`row tails (id ${J(id)}, ${g ?? "0.28"}, ${mode}): a page's own id may hold brackets and blanks`, u.nodes.length === 4 && N(u, 1).label === "邮箱" && N(u, 1).press === true && u.nodes[2].role === "AXStaticText", J(u.nodes.map((n) => [n.idx, n.role, n.label ?? n.text])));
+      }
+      const h = parseTree(payload("sh2", [W, [1, "AXButton", null, { press: true, help: "第一行\n第二行" }], after, end], { mode, grammar: g }));
+      check(`row tails (help over two lines, ${g ?? "0.28"}, ${mode}): one help, and the row after it is not swallowed`, h.nodes.length === 4 && N(h, 1).help === "第一行\n第二行" && N(h, 1).press === true && h.nodes[2].role === "AXStaticText", J(h.nodes.map((n) => [n.idx, n.role, n.help ?? n.label ?? n.text])));
+    }
+  }
+  // a text area whose value is a tree of this very kind: with elements[] its lines are taken by comparing
+  const INNER = '- [3] AXButton "保存" [enabled=false]\n  - AXGroup [help="滑动"]\n  - AXStaticText = "里面"\n  - [4] AXButton "删除" [actions=[press]]';
+  for (const g of ["055", undefined]) {
+    const t = parseTree(payload("sv2", [W, [1, "AXTextArea", "终端", { v: INNER, press: true }], end], { grammar: g }));
+    check(`row tails (a value that is itself a tree, ${g ?? "0.28"}): one row, nothing of it becomes a row`, t.nodes.length === 3 && N(t, 1).value === INNER && N(t, 2).label === "收尾", J(t.nodes.map((n) => [n.idx, n.role, n.label ?? n.text])));
+  }
+  const many = `见 ${Array.from({ length: 40 }, (_, i) => `"甲${i}" [id=x${i}]`).join(" ")} 等`;
+  const m = parseTree(payload("sm", [W, [1, "AXButton", null, { press: true, help: many }], after, end], { mode: "md", grammar: "055" }));
+  check("row tails: a help with 40 opening-looking pieces is still one help (the real opening is the first that fits)", m.nodes.length === 4 && N(m, 1).help === many && N(m, 1).press === true, J(m.nodes.map((n) => [n.idx, n.role, (n.help ?? "").length])));
+  const hostile = `- [0] AXWindow "W" [actions=[raise]]\n  - [1] AXButton [help="${'x" custom_actions=["a '.repeat(4000)}" enabled=false actions=[press]]\n  - [2] AXButton "后" [actions=[press]]`;
+  const t0 = Date.now();
+  const hz = parseTree({ snapshot_id: "sz", pid: 1, window_id: 2, tree_markdown: hostile });
+  check("row tails: 90 KB of quote-and-bracket pieces inside a help does not cost row length squared", hz.nodes.length === 3 && Date.now() - t0 < 300, `${Date.now() - t0} ms, ${hz.nodes.length} nodes`);
+});
+// The texts and fields below are the driver's own (walk_budget.rs note(), get_window_state with full_output).
+section("cua 0.55 cut walks", () => {
+  const rows = [[0, "AXWindow", "长窗", { a: ["AXRaise"] }], [1, "AXButton", "甲", { press: true }], [1, "AXButton", "乙", { press: true }]];
+  const NOTE = {
+    timeout: "⚠️ PARTIAL TREE: the 1000 ms timeout_ms budget ran out after 2 node(s) (1 discovered but not visited). Every element listed is real; elements after the cut are missing. If the element you need is absent, retry with a larger timeout_ms (e.g. 5000) or narrow with query / max_depth.",
+    node_budget: "⚠️ PARTIAL TREE: the max_elements node budget ran out after 2 node(s) (1 discovered but not visited). Every element listed is real; elements after the cut are missing. If the element you need is absent, retry with a larger max_elements or narrow with query / max_depth.",
+    app_unresponsive: "⚠️ PARTIAL TREE: the application stopped answering its accessibility API after 2 node(s) (1 discovered but not visited). Every element listed is real; elements after the cut are missing. If the element you need is absent, retry in a moment or with a larger timeout_ms (e.g. 5000).",
+    huge_container: "⚠️ PARTIAL TREE: a container with more children than can be enumerated (e.g. a spreadsheet's cell grid) was not expanded after 2 node(s) (1 discovered but not visited). Every element listed is real; elements after the cut are missing. If the element you need is absent, retry with a max_elements above that container's child count, or act inside it by pixel (x,y) off the screenshot.",
+  };
+  const cut = (sid, reason, o = {}) => {
+    const p = payload(sid, rows.slice(0, 2), { grammar: "055" });
+    if (o.line !== false) p.tree_markdown = `${p.tree_markdown.trimEnd()}\n${NOTE[reason] ?? NOTE.timeout}`;
+    return parseTree(o.fields === false ? p : { ...p, truncated: true, ...(reason ? { truncation_reason: reason } : {}), nodes_visited: 2, nodes_pending: 1, timeout_ms: 1000 });
+  };
+  const full = parseTree({ ...payload("s60", rows, { grammar: "055" }), truncated: false, nodes_visited: 3, nodes_pending: 0, timeout_ms: 1000 });
+  const byTime = cut("s61", "timeout");
+  const byCount = cut("s62", "node_budget");
+  check("cut walk: the notice line is not a row; the cut is worded from the payload's fields", byTime.nodes.length === 2 && byTime.truncated === "walk cut short: the driver's 1000 ms time limit ran out after 2 node(s), at least 1 more not visited" && byCount.truncated === "walk cut short: the driver's node cap was reached after 2 node(s), at least 1 more not visited", J([byTime.nodes.length, byTime.truncated, byCount.truncated]));
+  check(
+    "cut walk: stopped by the clock = partial; stopped at the node cap or at a container too large to list = not (the cut falls on the same row every time)",
+    byTime.partial === true && cut("s63", "app_unresponsive").partial === true && cut("s64", "something_new").partial === true && cut("s65", undefined).partial === true && byCount.partial === false && cut("s66", "huge_container").partial === false && full.partial === false && full.truncated === undefined,
+    J([byTime.partial, byCount.partial, full.partial, full.truncated])
+  );
+  check("cut walk: the driver's line alone (no fields) is read the same way", cut("s67", "timeout", { fields: false }).partial === true && cut("s68", "node_budget", { fields: false }).partial === false && cut("s69", "huge_container", { fields: false }).partial === false && cut("s6a", "timeout", { fields: false }).truncated.startsWith("PARTIAL TREE: the 1000 ms timeout_ms budget ran out"), J(cut("s67", "timeout", { fields: false }).truncated));
+  check("cut walk: fields alone (no line) too", cut("s6b", "timeout", { line: false }).partial === true && cut("s6c", "node_budget", { line: false }).partial === false, J(cut("s6b", "timeout", { line: false }).truncated));
+  check("cut walk: renderTree says so", /\n⚠ walk cut short: the driver's 1000 ms time limit ran out after 2 node\(s\), at least 1 more not visited$/.test(renderTree(byTime)), renderTree(byTime));
+  const old = parseTree(payload("s6d", rows.slice(0, 2), { truncated: "AX tree truncated at 2 nodes (app has a very large accessibility tree)." }));
+  check("cut walk: a 0.28 node-cap notice, and an ordinary 0.28 payload (elements_complete:false), are not partial", old.partial === false && old.truncated.startsWith("AX tree truncated at 2 nodes") && parseTree(payload("s6e", rows)).partial === false);
+  const inText = parseTree(payload("s6f", [rows[0], [1, "AXStaticText", "第一行\nTree truncated at dawn\nPARTIAL TREE: 不是提示", { a: [] }], rows[1]]));
+  check("cut walk: text inside a value that reads like a notice stays text", inText.truncated === undefined && inText.partial === false && inText.nodes.length === 3, J([inText.truncated, inText.nodes.length]));
+  const gone = renderDiff(full, byTime).text;
+  check("cut walk: a diff TO a partial walk warns that a row listed as gone may still be there", /−1/.test(gone) && /\n⚠ walk cut short: the driver's 1000 ms time limit ran out[^\n]*a row listed as gone may still be there$/.test(gone), gone);
+  const back = renderDiff(byTime, full).text;
+  check("cut walk: a diff FROM a partial walk warns that a row listed as new may have been there", /\+1/.test(back) && /may have been there already$/.test(back), back);
+  const same = renderDiff(byCount, cut("s6g", "node_budget")).text;
+  check("cut walk: a node-cap cut on both sides adds no warning", /no change/.test(same) && !/cut short|may /.test(same), same);
+  const q = renderQuery(byTime, "乙");
+  check("cut walk: a query that finds nothing in it does not call what it shows 'the whole window'", /0 of 2 rows match/.test(q) && q.includes("what this walk reached (NOT the whole window):") && /\n⚠ walk cut short/.test(q) && !q.includes("\nthe whole window:"), q);
+  check("…and on a complete walk it still does", renderQuery(full, "丙").includes("\nthe whole window:"), renderQuery(full, "丙"));
+});
+
 console.log(`\n${total - failures}/${total} passed, ${failures} failed`);
 process.exit(failures ? 1 : 0);

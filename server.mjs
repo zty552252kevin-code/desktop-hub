@@ -86,6 +86,10 @@ function evict(name, entry) {
       winStore.clear();
       snapOwners.clear();
       lastSidNum = -1;
+      // …and what was learnt about the driver behind it: the next one may be another version (an upgrade, or a
+      // rollback — an older driver refuses the parameters a newer one needs)
+      needFullOutput = false;
+      walkTimeout = false;
     }
   }
 }
@@ -177,6 +181,39 @@ function probeBackendAfterDeadline(backend) {
 // perform. The retry is not itself revive-eligible, so a re-expiry just
 // surfaces. Lazy groups: session labels are free-form and may contain quotes.
 const SESSION_ENDED_RE = /session '(.+?)' has ended; tool call '(.+?)' was rejected/;
+// Later drivers word it differently and no longer name the tool; the refusal carries a code instead
+// (structuredContent.refusal = {code:"session_ended", message}), which only the daemon puts on the call it
+// refused. A call without a session label runs in the transport's own unnamed session, which ends the same way.
+const SESSION_ENDED_NEW_RE = /^session '(.+?)' has ended; call start_session with session /;
+const SESSION_ENDED_UNNAMED_RE = /^this transport's unnamed session has ended; call start_session without a session label/;
+// → null (not that refusal), or { label, how } — label undefined = the unnamed session. A 0.28 driver ends a
+// session that sat idle; a later one restarts an idle session by itself and refuses only one that was ended
+// (end_session, a revoke, its connection closing).
+function endedSession(result, tool) {
+  const t = resultText(result);
+  const m = SESSION_ENDED_RE.exec(t);
+  // The not-executed premise only holds when the rejection is of THIS call:
+  // an isError result that merely QUOTES an inner rejection (e.g.
+  // replay_trajectory reporting a failed inner turn) names a different tool,
+  // and blindly re-running the outer call would double-execute whatever side
+  // effects it already had.
+  if (m) return m[2] === tool ? { label: m[1], how: "expired" } : null;
+  const named = (msg) => {
+    const s = String(msg ?? "").trim();
+    const n = SESSION_ENDED_NEW_RE.exec(s);
+    if (n) return { label: n[1], how: "been ended" };
+    return SESSION_ENDED_UNNAMED_RE.test(s) ? { label: undefined, how: "been ended" } : null;
+  };
+  const sc = result?.structuredContent;
+  if (sc && typeof sc === "object") {
+    // a structured result that is some OTHER refusal (or a tool's own failure report) is never this one, whatever
+    // text it quotes
+    const code = sc.refusal?.code ?? sc.code;
+    return code === "session_ended" ? named(sc.refusal?.message ?? sc.message ?? t) : null;
+  }
+  // text only: the whole reply must BE that sentence (a quoted inner rejection sits inside a longer text)
+  return named(t);
+}
 
 function resultText(res) {
   return (res?.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
@@ -189,17 +226,13 @@ function withNote(result, note) {
 async function backendCall(backend, tool, args, signal) {
   const result = await rawBackendCall(backend, tool, args, signal);
   if (backend !== "cua" || tool === "start_session" || !result?.isError) return result;
-  const m = SESSION_ENDED_RE.exec(resultText(result));
-  // The not-executed premise only holds when the rejection is of THIS call:
-  // an isError result that merely QUOTES an inner rejection (e.g.
-  // replay_trajectory reporting a failed inner turn) names a different tool,
-  // and blindly re-running the outer call would double-execute whatever side
-  // effects it already had.
-  if (!m || m[2] !== tool) return result;
-  const ended = m[1];
+  const end = endedSession(result, tool);
+  if (!end) return result;
+  const ended = end.label;
+  const which = ended === undefined ? "the hub's unnamed session" : `session '${ended}'`;
   let revive;
   try {
-    revive = await rawBackendCall("cua", "start_session", { session: ended }, signal);
+    revive = await rawBackendCall("cua", "start_session", ended === undefined ? {} : { session: ended }, signal);
   } catch (err) {
     // Revive died (timeout/abort/backend crash) — the original rejection
     // stands and the action still never ran; report both.
@@ -213,7 +246,7 @@ async function backendCall(backend, tool, args, signal) {
     const hint = /not available to this transport/.test(why)
       ? ` This name was minted on a previous hub/backend process and cannot be revived here (ignore the "revive it" hint above) — use a NEW session label, or omit session.`
       : "";
-    return withNote(result, `[desktop-hub] auto-revive of session '${ended}' failed: ${why}.${hint}`);
+    return withNote(result, `[desktop-hub] auto-revive of ${which} failed: ${why}.${hint}`);
   }
   let retried;
   try {
@@ -223,14 +256,15 @@ async function backendCall(backend, tool, args, signal) {
     // rejection it may have executed before dying. Never echo the original
     // "not executed" text here; the honest answer is outcome-unknown.
     return textResult(
-      `[desktop-hub] session '${ended}' had expired; auto-revived it and retried '${tool}', but the retry failed to complete: ${err?.message ?? err}. Outcome UNKNOWN — the action may have executed; re-observe (window_state / desktop_screenshot) before re-issuing.`,
+      `[desktop-hub] ${which} had ${end.how}; auto-revived it and retried '${tool}', but the retry failed to complete: ${err?.message ?? err}. Outcome UNKNOWN — the action may have executed; re-observe (window_state / desktop_screenshot) before re-issuing.`,
       true
     );
   }
-  if (retried?.isError) return retried;
+  // (the note says which call this answer belongs to: a token of the ended session is refused as stale here)
+  if (retried?.isError) return withNote(retried, `[desktop-hub] ${which} had ${end.how}; auto-revived it, and the answer above is the retry's.`);
   return withNote(
     retried,
-    `[desktop-hub] session '${ended}' had expired; auto-revived it and retried this call (result above is the retry). ` +
+    `[desktop-hub] ${which} had ${end.how}; auto-revived it and retried this call (result above is the retry). ` +
       `element_tokens/snapshot_ids minted before the expiry may be stale — re-run window_state before element-indexed actions.`
   );
 }
@@ -493,6 +527,13 @@ let lastSidAt = 0; // when the highest snapshot id seen so far arrived
 // rather than from a version string: `cua-driver mcp` is a proxy and its
 // reported version can differ from the daemon that does the work.
 let needFullOutput = false;
+// Later drivers bound an AX walk at 1 s by default and return whatever they reached by then
+// (`truncated:true, truncation_reason:"timeout"`); full_output does not lift that. The hub wants the whole
+// window, so once a driver has answered that way it is asked for more time on every walk. Learnt from the
+// reply, like needFullOutput: an older driver refuses a parameter it does not know, and only a driver that has
+// the parameter reports this reason.
+const WALK_TIMEOUT_MS = 20_000; // the driver's own backstop is twice this plus 5 s: inside the 50 s batch budget
+let walkTimeout = false;
 
 const winKey = (pid, windowId) => `${pid}:${windowId}`;
 // Windows the model had looked at whose record the hub dropped to bound memory: a find there
@@ -764,7 +805,8 @@ async function fetchTree(a, signal, o = {}) {
   if (a.session !== undefined) args.session = a.session;
   const once = async () => {
     const t0 = Date.now();
-    const res = await backendCall("cua", "get_window_state", needFullOutput ? { ...args, full_output: true } : args, signal);
+    const more = { ...(needFullOutput ? { full_output: true } : {}), ...(walkTimeout ? { timeout_ms: WALK_TIMEOUT_MS } : {}) };
+    const res = await backendCall("cua", "get_window_state", { ...args, ...more }, signal);
     return { res, ms: Date.now() - t0 };
   };
   let { res, ms } = await once();
@@ -773,6 +815,13 @@ async function fetchTree(a, signal, o = {}) {
     needFullOutput = true;
     ({ res, ms } = await once());
     sc = res?.isError ? null : payloadOf(res);
+  }
+  if (sc && sc.truncated === true && sc.truncation_reason === "timeout" && !walkTimeout) {
+    walkTimeout = true;
+    const again = await once();
+    const sc2 = again.res?.isError ? null : payloadOf(again.res);
+    if (sc2) ({ res, ms } = again), (sc = sc2);
+    else walkTimeout = false; // refused all the same (something in between does not know the parameter): keep the cut walk
   }
   const tree = sc ? parseTree(sc, { pid: a.pid, windowId: a.window_id, at: Date.now(), walkMs: ms }) : null;
   const images = (res?.content ?? []).filter((c) => c.type === "image");
@@ -1157,7 +1206,8 @@ function carry(entry, rec, to, idx) {
   if (r.error) {
     shownRows(entry, to); // the candidates are printed, so their tokens must be honoured
     const c = carryIndex(from, to, idx).candidates ?? [];
-    throw new Error(`${r.error}. Nothing was executed.${c.length ? ` Current candidates (usable as element_token): ${c.join("; ")}.` : ""}`);
+    const cut = to.partial ? ` — or it was not reached: the last walk of this window was cut short (${clip(to.truncated ?? "walk cut short", 100)}), which says nothing about the row being gone; look again (window_state)` : "";
+    throw new Error(`${r.error}${cut}. Nothing was executed.${c.length ? ` Current candidates (usable as element_token): ${c.join("; ")}.` : ""}`);
   }
   return r;
 }
@@ -1847,6 +1897,26 @@ class StepError extends Error {
 // and all had landed). The rest were right 4 times out of 4: flag those and
 // stop the batch, so a dead click is not followed by typing into whatever
 // holds focus.
+// What a later driver puts in structuredContent when it REFUSED a call and sent nothing: either
+// {status:"refused", refusal:{code,…}} or {effect:"refused", error:{code}} / {effect:"refused", code}. Any other
+// structured error says nothing of the kind — code:"tool_invocation_failed" is the driver's catch-all for a call
+// that died on the way, and such a call may have run.
+// A later driver turns a call that RAN into an error when it cannot vouch for its own result
+// ({code:"action_outcome_mismatch"|"typed_output_mismatch", execution_state:"unknown"}, "…; the tool may have
+// executed"); such a text can hold the very words a refusal is recognised by ("invalid public projection",
+// "missing field").
+function mayHaveRun(res) {
+  const sc = res?.structuredContent;
+  return (!!sc && typeof sc === "object" && sc.execution_state === "unknown") || /may have executed/i.test(resultText(res));
+}
+function refusalCode(res) {
+  const sc = res?.structuredContent;
+  if (!sc || typeof sc !== "object") return undefined;
+  if (sc.refusal && typeof sc.refusal === "object" && typeof sc.refusal.code === "string" && (sc.status === undefined || sc.status === "refused")) return sc.refusal.code;
+  if (sc.effect === "refused") return String(sc.error?.code ?? sc.code ?? "refused");
+  return undefined;
+}
+
 function actionEffect(res, s) {
   let sc = res?.structuredContent;
   if (!sc || typeof sc !== "object") {
@@ -2027,6 +2097,14 @@ async function runSteps(input, signal, single) {
         const f = await fetchTree(s, scoped.signal);
         if (!f.tree) throw new StepError(`find: window_state failed: ${resultText(f.res).slice(0, 200)}`);
         if (f.tree.degraded || !f.tree.snapshotId) throw new StepError(`find: ${await degradedText(s, f.tree)}`);
+        // A find answers "the one control with this name"; a walk the driver cut short at its time limit cannot
+        // show that there is only one, nor that there is none.
+        if (f.tree.partial) {
+          throw new StepError(
+            `find: the driver did not get through this window (${clip(f.tree.truncated ?? "walk cut short", 120)}), so what a find would pick cannot be shown to be the only match, and what it misses cannot be shown to be absent. Nothing was sent. Look at what was reached (window_state) and act on a row's token, or try again once the app responds.`,
+            "none"
+          );
+        }
         tree = f.tree;
         if (!base && ok === 0) {
           base = tree;
@@ -2299,10 +2377,13 @@ async function runSteps(input, signal, single) {
       for (let k = 0; k < times; k++) {
         sent = true;
         res = await backendCall("cua", tool, args, scoped.signal);
-        if (res?.isError && k === 0 && node && /stale/i.test(resultText(res))) {
+        if (res?.isError && k === 0 && node && (/stale/i.test(resultText(res)) || refusalCode(res) === "stale_element_token")) {
           // Something outside this hub walked the window (another session
           // shares the daemon). The refusal means nothing ran: re-identify
           // the element in a fresh tree, once.
+          // …or the token's session had ended and was just revived: a later driver retires a session's
+          // snapshots with it.
+          const revivedFirst = /\[desktop-hub\][^\n]*auto-revived/.test(resultText(res));
           const f = await fetchTree({ pid: s.pid, window_id: tree.windowId, session: s.session }, scoped.signal);
           if (!f.tree || f.tree.degraded || !f.tree.snapshotId) throw new StepError("upstream refused a stale token and the window could not be read again");
           // Same instant, same window: only an identical tree is re-targeted
@@ -2314,7 +2395,7 @@ async function runSteps(input, signal, single) {
           }
           const r = { idx: twin.idx, node: twin };
           args.element_token = `${f.tree.snapshotId}:${r.idx}`;
-          notes.push(`re-identified after an outside walk → ${nodeName(f.tree, r.node)}`);
+          notes.push(`re-identified after ${revivedFirst ? "its session had ended and was revived" : "an outside walk"} → ${nodeName(f.tree, r.node)}`);
           res = await backendCall("cua", tool, args, scoped.signal);
         }
         if (res?.isError) break;
@@ -2324,13 +2405,32 @@ async function runSteps(input, signal, single) {
         if (k + 1 < times) await sleep(40, scoped.signal);
       }
       if (res?.isError) {
-        const t = resultText(res);
+        const code = refusalCode(res);
+        let t = resultText(res);
+        if (code !== undefined) {
+          // the code is what the branches below go by; the text of a structured refusal need not repeat it
+          const sc = res.structuredContent;
+          if (!t.trim()) t = String(sc.refusal?.message ?? sc.summary ?? sc.error?.hint ?? "refused");
+          if (!t.includes(code)) t = `${t.trimEnd()} (${code})`;
+        }
         const hubNote = t.indexOf("[desktop-hub]");
         const up = hubNote >= 0 ? `${t.slice(0, Math.min(hubNote, 200))} ${t.slice(hubNote)}` : t.slice(0, 300);
         if (/delivered \d+ of \d+/.test(t)) {
           throw new StepError(`${up.trim()} — [desktop-hub] delivery counts are unreliable in BOTH directions and upstream's "retry the suffix" advice repeats text: read what is actually in the field (window_state query) before typing anything more.`, "partial");
         }
         if (done > 0) throw new StepError(`repeat stopped after ${done} of ${times}: ${up.trim() || "upstream error"}`, "partial");
+        if (code !== undefined && s.action === "type" && res.structuredContent?.effect === "refused") {
+          // A later driver's refusal of a `type` does not always come before everything (read from its source,
+          // not measured): the x,y form moves the focus to the point before it checks the key window and the
+          // typing budget; with an element, a call the keyboard rules refuse still tries the accessibility write
+          // first, and answers with that refusal when it cannot confirm the write.
+          if (!node && Number.isFinite(s.x) && /^(window_not_key|type_text_synthesis_budget_exceeded)$/.test(code)) {
+            throw new StepError(`${up.trim()} — [desktop-hub] no key was sent, but the driver moves the focus to the point before it decides this: the focus may now be at (${s.x},${s.y}).`, "unknown");
+          }
+          if (node && /^(same_pid_keyboard_ambiguity|minimized_or_hidden_window)$/.test(code)) {
+            throw new StepError(`${up.trim()} — [desktop-hub] no keystroke was sent, but with an element the driver first tries to write the text through accessibility and answers with this refusal when it cannot confirm that write: the text may be in the field. Read the field before typing again (set_value replaces whatever it holds).`, "unknown");
+          }
+        }
         if (/same_pid_keyboard_ambiguity/.test(t)) {
           // Measured on cua 0.28.2 (an Edge with two windows): type, key, hotkey and the px form of type_text are all refused.
           throw new StepError(
@@ -2338,11 +2438,16 @@ async function runSteps(input, signal, single) {
             "none"
           );
         }
+        if (/window_not_key/.test(t)) {
+          // Later drivers aim keys at one window of a multi-window app by making it the app's key window first;
+          // when that cannot be confirmed they refuse with this code and send nothing.
+          throw new StepError(`${up.trim()} — [desktop-hub] the driver could not make this window the app's key window, so no key was sent. A click into the field first (find, then click) may give it the focus; set_value on a field and menu do not depend on it.`, "none");
+        }
         if (/off_space_or_ax_unresolved|ax_unresolved/.test(t) && Number.isInteger(s.window_id)) {
           const why = await unreachableReason(s, scoped.signal);
           if (why) throw new StepError(why, "none");
         }
-        throw new StepError(up.trim() || "upstream error", /refus|rejected|stale|not found|invalid|missing/i.test(t) ? "none" : "unknown");
+        throw new StepError(up.trim() || "upstream error", !mayHaveRun(res) && (code !== undefined || /refus|rejected|stale|not found|invalid|missing/i.test(t)) ? "none" : "unknown");
       }
       // Measured on cua 0.28.2 / Edge: an AX-written value that reads as a number
       // ("888", "12.5", "-5", "1e3") leaves a web <input> EMPTY, while "888a" or "1,000" stick.
@@ -2697,7 +2802,7 @@ async function handleCall(name, input, signal) {
       try {
         res = await backendCall(input.server, input.tool, input.args ?? {}, signal);
         // An error that is not a refusal may have run all the same (a timeout): as in act, it counts.
-        if (!(res?.isError && /refus|rejected|stale|not found|invalid|missing|validation error|unknown (field|parameter)/i.test(resultText(res)))) deskActed();
+        if (!(res?.isError && !mayHaveRun(res) && /refus|rejected|stale|not found|invalid|missing|validation error|unknown (field|parameter)/i.test(resultText(res)))) deskActed();
         // A walk made through desk_call mints tokens too: remember whose they are, and which rows are menu-bar items.
         if (input.server === "cua" && input.tool === "get_window_state" && !res?.isError && Number.isInteger(input.args?.pid)) {
           const sc = payloadOf(res);

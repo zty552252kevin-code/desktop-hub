@@ -3182,6 +3182,200 @@ const TABLE = (names) => [
   }
 }
 
+// 7.6g a cua 0.55 driver (fake_mode v055): compact replies, walks the driver
+// cuts short (by its clock, at its node cap), the 0.55 row grammar, structured
+// refusals, an action that ran and is reported as an error, ended sessions.
+{
+  const H = await fakeHub("smoke-fake-055");
+  const { call, ctl, log, win } = H;
+  const ROWS055 = [
+    [0, "AXWindow", "新版窗", { a: ["AXRaise"] }],
+    [1, "AXGroup", null, { ix: false, help: "向左滑动归档" }],
+    [1, "AXButton", "保存", { press: true, en: false }],
+    [1, "AXButton", "通过", { press: true, id: "ok", help: "批准", ca: ["置顶"] }],
+    [1, "AXCheckBox", "记住", { en: false, a: [] }],
+    [1, "AXButton", null, { press: true, help: "无标签图标" }],
+    [1, "AXStaticText", "尾巴", { a: [] }],
+    [1, "AXButton", "删除", { press: true }],
+  ];
+  const gws = (lg) => walks(lg).map((c) => `${c.args.full_output === true ? "full" : "plain"}${c.args.timeout_ms !== undefined ? `+${c.args.timeout_ms}` : ""}`).join(" ");
+  try {
+    await ctl("fake_mode", { v055: true });
+    await section("7.6g 0.55 walk", async () => {
+      const W = await win(771, ROWS055);
+      const r = textOf(await call("window_state", { ...W, include_screenshot: false }));
+      let lg = await log();
+      check("cua 0.55: a markdown-only reply → one re-walk with full_output (and no parameter the driver was not seen to need)", gws(lg) === "plain full", J(lg.calls));
+      check(
+        "…rows in the 0.55 bracket grammar read right (enabled=false, a help-only row, custom_actions, no bracket at all)",
+        bare(r) ===
+          'win 771 "新版窗" pid 4242 · snapshot s00000102 · 8 rows\n- (0) AXWindow "新版窗"\n - AXGroup help="向左滑动归档"\n - [1] AXButton "保存" [disabled]\n - [2] AXButton "通过"\n - (3) AXCheckBox "记住" [disabled]\n - [4] AXButton help="无标签图标"\n - (5) AXStaticText "尾巴"\n - [6] AXButton "删除"',
+        r
+      );
+      const a1 = textOf(await call("act", { action: "click", ...W, find: { label: "删除" } }));
+      lg = await log();
+      check("…later walks ask for full_output from the start, and the press goes to the row found", gws(lg) === "full full" && lg.actions.length === 1 && lg.actions[0].target?.label === "删除", J(lg.calls) + a1);
+    });
+    await section("7.6g 0.55 walk cut by the clock", async () => {
+      const W = await win(772, ROWS055);
+      await ctl("fake_walk_cost", { ms: 5000 }); // five times the driver's default limit, a quarter of the hub's
+      const first = textOf(await call("window_state", { ...W, include_screenshot: false }));
+      let lg = await log();
+      check("a walk the driver cut at its default 1 s: the hub asks again with its own limit, once, and shows the whole window", gws(lg) === "full full+20000" && first.includes(" · 8 rows") && first.includes('AXButton "删除"') && !first.includes("⚠"), J(lg.calls) + first);
+      await ctl("fake_walk_cost", { ms: 40000 }); // twice the hub's limit: the driver gets through half of the 8 rows
+      const r = textOf(await call("window_state", { ...W, include_screenshot: false }));
+      lg = await log();
+      check("…from then on every walk carries the limit; one the driver still cannot finish is shown as far as it got, and says so in the hub's words", gws(lg) === "full+20000" && r.includes(" · 4 rows") && r.includes('AXButton "通过"') && !r.includes('"删除"') && r.endsWith("\n⚠ walk cut short: the driver's 20000 ms time limit ran out after 4 node(s), at least 1 more not visited") && !r.includes("PARTIAL TREE"), J(lg.calls) + r);
+      const d = textOf(await call("window_state", { ...W, diff: true }));
+      check("…a diff made on such a walk says that a row it lists as gone may still be there", /a row listed as gone may still be there$/.test(d), d);
+      const q = textOf(await call("window_state", { ...W, query: "删除" }));
+      check("…a query that finds nothing in it does not call what it shows the whole window", /0 of 4 rows match/.test(q) && q.includes("what this walk reached (NOT the whole window):") && q.includes("rows it did not reach were not searched") && !q.includes("\nthe whole window:"), q);
+      const q2 = textOf(await call("window_state", { ...W, query: "通过" }));
+      check("…and one that does find something says the rest was not searched", /1 match/.test(q2) && q2.includes("rows it did not reach were not searched"), q2);
+      await log();
+      const f = await call("act", { action: "click", ...W, find: { label: "删除" } });
+      lg = await log();
+      check("…find on it is refused, nothing sent: neither 'the only one' nor 'absent' can be shown", f.isError === true && /did not get through this window/.test(textOf(f)) && /Nothing was sent/.test(textOf(f)) && lg.actions.length === 0, textOf(f));
+      const g = await call("act", { action: "click", ...W, find: { label: "删除" }, if_present: true });
+      lg = await log();
+      check("…and if_present does not turn that into 'skipped, absent'", g.isError === true && !/skipped/.test(textOf(g)) && lg.actions.length === 0, textOf(g));
+      const tok = `${sidOf(r)}:${rowOf(r, "AXButton", "通过")}`;
+      const t = await call("act", { action: "click", ...W, element_token: tok });
+      lg = await log();
+      check("…a row the model was shown can still be pressed by its token; the report says its walk was cut short too", !t.isError && lg.actions.length === 1 && lg.actions[0].target?.label === "通过" && textOf(t).includes("cut short"), textOf(t));
+      const seen = textOf(await call("window_state", { ...W, include_screenshot: false }));
+      const tok2 = `${sidOf(seen)}:${rowOf(seen, "AXButton", "通过")}`;
+      await ctl("fake_walk_cost", { ms: 80000 }); // the next walk gets through a quarter: the row is not in it
+      await call("act", { action: "click", ...W, element_token: tok2 }); // its report is that shorter walk
+      await log();
+      const c = await call("act", { action: "click", ...W, element_token: tok2, again: true });
+      lg = await log();
+      check("…a token whose row the latest (shorter) walk did not reach: refused as 'not reached', not as 'gone'; nothing sent", c.isError === true && /or it was not reached: the last walk of this window was cut short/.test(textOf(c)) && lg.actions.length === 0, textOf(c));
+      await ctl("fake_walk_cost", { ms: 40000 });
+      await call("window_state", { ...W, include_screenshot: false });
+      await ctl("fake_walk_cost", { ms: 0 });
+      const d2 = textOf(await call("window_state", { ...W, diff: true }));
+      check("…the first complete walk after it: rows listed as new carry the 'may have been there already' note", d2.includes('AXButton "删除"') && d2.includes("may have been there already"), d2);
+      const ok = await call("act", { action: "click", ...W, find: { label: "删除" } });
+      lg = await log();
+      check("…and find works again", !ok.isError && lg.actions.length === 1 && lg.actions[0].target?.label === "删除", textOf(ok));
+    });
+    await section("7.6g 0.55 walk cut at the node cap", async () => {
+      const W = await win(775, ROWS055);
+      await ctl("fake_node_cap", { n: 4 });
+      const r = textOf(await call("window_state", { ...W, include_screenshot: false }));
+      check("a walk stopped at the driver's node cap (its markdown ends with a PARTIAL TREE line as well): shown as far as it got, in the hub's words", r.includes(" · 4 rows") && r.endsWith("\n⚠ walk cut short: the driver's node cap was reached after 4 node(s), at least 1 more not visited") && !r.includes("PARTIAL TREE"), r);
+      await log();
+      const f = await call("act", { action: "click", ...W, find: { label: "通过" } });
+      let lg = await log();
+      check("…find still works on it, as on a 0.28 tree cut at its cap (the cut falls on the same row every time)", !f.isError && lg.actions.length === 1 && lg.actions[0].target?.label === "通过" && !/may still be there|may have been there/.test(textOf(f)), textOf(f));
+      const m = await call("act", { action: "click", ...W, find: { label: "删除" } });
+      lg = await log();
+      check("…and a name past the cap is the ordinary 'nothing matches'", m.isError === true && /nothing matches/.test(textOf(m)) && lg.actions.length === 0, textOf(m));
+      await ctl("fake_node_cap", { n: 0 });
+    });
+    await section("7.6g 0.55 refusals", async () => {
+      const W = await win(773, [[0, "AXWindow", "输入窗", { a: ["AXRaise"] }], [1, "AXTextField", "备注", { v: "", press: true }], [1, "AXButton", "提交", { press: true }]]);
+      const v = textOf(await call("window_state", { ...W, include_screenshot: false }));
+      await log();
+      await ctl("fake_next_reply", { refusal: { code: "window_not_key", form: "background", message: "the addressed window is not the app's key window" } });
+      const k = await call("act", { action: "key", ...W, key: "return" });
+      let lg = await log();
+      check("window_not_key (0.55's answer where 0.28 said same_pid_keyboard_ambiguity), in the driver's own envelope: the hub says what still works, nothing was sent", k.isError === true && /Background input refused \(window_not_key\)/.test(textOf(k)) && /could not make this window the app's key window/.test(textOf(k)) && /not executed/.test(textOf(k)) && lg.actions.length === 0 && lg.calls.some((c) => c.refused === "window_not_key"), textOf(k));
+      await ctl("fake_next_reply", { refusal: { code: "point_outside_window", form: "effect", message: "" } });
+      const e = await call("act_batch", { ...W, steps: [{ action: "click", find: { label: "提交" } }, { action: "click", find: { label: "提交" }, again: true }] });
+      lg = await log();
+      check("a structured refusal with no text at all ({effect:\"refused\", error:{code}}): its code is shown, the step counts as not sent, the batch stops", e.isError === true && /point_outside_window/.test(textOf(e)) && lg.actions.length === 0 && !/outcome unknown|may have/i.test(textOf(e)), textOf(e));
+      await ctl("fake_next_reply", { error: "internal action outcome mismatch for click: invalid public projection: missing field `route`; the tool may have executed. Verify state before retrying.", structured: { code: "action_outcome_mismatch", execution_state: "unknown" } });
+      const o = await call("act", { action: "click", ...W, find: { label: "提交" } });
+      lg = await log();
+      check("an action that RAN and is reported as an error (0.55: action_outcome_mismatch, 'the tool may have executed'): outcome UNKNOWN, never 'not executed', and the hub looks again", o.isError === true && /outcome UNKNOWN/.test(textOf(o)) && !/not executed/.test(textOf(o)) && lg.actions.length === 1 && walks(lg).length >= 2, J(lg.calls.map((c) => c.tool)) + textOf(o));
+      const field = `${sidOf(v)}:${rowOf(v, "AXTextField", "备注")}`;
+      const seen = textOf(await call("window_state", { ...W, include_screenshot: false }));
+      const tokF = `${sidOf(seen)}:${rowOf(seen, "AXTextField", "备注")}`;
+      await log();
+      await ctl("fake_next_reply", { refusal: { code: "same_pid_keyboard_ambiguity", form: "background", message: "another window of this app could take the keys" } });
+      const ty = await call("act", { action: "type", ...W, element_token: tokF, text: "你好" });
+      lg = await log();
+      check("typing into an element refused by the keyboard rules: the driver tried the accessibility write first, so 'the text may be in the field', not 'not executed'", ty.isError === true && /the text may be in the field/.test(textOf(ty)) && /outcome UNKNOWN/.test(textOf(ty)) && !/not executed/.test(textOf(ty)), textOf(ty) + field);
+      await ctl("fake_next_reply", { refusal: { code: "same_pid_keyboard_ambiguity", form: "background", message: "another window of this app could take the keys" } });
+      const ky = await call("act", { action: "key", ...W, key: "tab" });
+      lg = await log();
+      check("…the same refusal of a key press is 'not executed', with the hub's note on what still works", ky.isError === true && /not executed/.test(textOf(ky)) && /another top-level window/.test(textOf(ky)) && lg.actions.length === 0, textOf(ky));
+    });
+    await section("7.6g 0.55 ended sessions", async () => {
+      const W = await win(774, FORM());
+      await call("window_state", { ...W, include_screenshot: false });
+      await log();
+      await ctl("fake_session_end", {});
+      const r = await call("window_state", { ...W, include_screenshot: false });
+      let lg = await log();
+      check(
+        "the connection's own unnamed session has been ended: one start_session without a label, then the same call again",
+        !r.isError && textOf(r).includes('AXButton "保存"') && J(lg.calls.map((c) => [c.tool, c.refused ?? null, c.args.session ?? null])) === J([["get_window_state", "session_ended", null], ["start_session", null, null], ["get_window_state", null, null]]),
+        J(lg.calls) + textOf(r)
+      );
+      const s1 = textOf(await call("window_state", { ...W, include_screenshot: false, session: "备用" }));
+      const tok = `${sidOf(s1)}:${rowOf(s1, "AXButton", "保存")}`;
+      await log();
+      await ctl("fake_session_end", { session: "备用" });
+      const a = await call("act", { action: "click", ...W, element_token: tok, session: "备用", observe: false });
+      lg = await log();
+      check(
+        "a named session that has been ended (0.55 sentence, code session_ended) takes its snapshots with it: revived with its label, the stale token re-identified on a fresh walk, the press sent once and to the same control",
+        !a.isError && lg.actions.length === 1 && lg.actions[0].target?.label === "保存" && J(lg.calls.map((c) => c.tool + (c.refused ? `(${c.refused})` : c.stale ? "(stale)" : ""))) === J(["click(session_ended)", "start_session", "click(stale)", "get_window_state", "click"]) && /re-identified after its session had ended and was revived/.test(textOf(a)),
+        J(lg.calls.map((c) => c.tool + (c.refused ? `(${c.refused})` : c.stale ? "(stale)" : ""))) + textOf(a)
+      );
+      const QUOTE = "session 'x' has ended; call start_session with session 'x' to start it again, or use a new session label";
+      await ctl("fake_next_reply", { error: `replay stopped at step 3: ${QUOTE}` });
+      const q = await call("act", { action: "click", ...W, find: { label: "保存" }, again: true, observe: false });
+      lg = await log();
+      check("a failure that only QUOTES the sentence is not that refusal: no revive, no second run", q.isError === true && lg.actions.length === 1 && !lg.calls.some((c) => c.tool === "start_session"), J(lg.calls) + textOf(q));
+      await ctl("fake_next_reply", { refusal: { code: "window_not_key", message: QUOTE } });
+      const o = await call("act", { action: "key", ...W, key: "return" });
+      lg = await log();
+      check("…nor is another refusal whose message quotes it", o.isError === true && lg.actions.length === 0 && !lg.calls.some((c) => c.tool === "start_session"), J(lg.calls) + textOf(o));
+    });
+  } finally {
+    await H.c.close().catch(() => {});
+  }
+}
+
+// 7.6h the driver is replaced under a running hub (an upgrade, then a rollback):
+// what the hub learnt about the old one must not be used on the new one.
+{
+  const H = await fakeHub("smoke-fake-swap");
+  const { call, ctl, log, win } = H;
+  const settle = () => new Promise((r) => setTimeout(r, 400)); // the hub notices the exit on its own
+  const gws = (lg) => walks(lg).map((c) => `${c.args.full_output === true ? "full" : "plain"}${c.args.timeout_ms !== undefined ? `+${c.args.timeout_ms}` : ""}`).join(" ");
+  try {
+    await section("7.6h driver replaced", async () => {
+      await ctl("fake_mode", { compact034: true });
+      let W = await win(781, FORM());
+      await call("window_state", { ...W, include_screenshot: false });
+      await call("window_state", { ...W, include_screenshot: false });
+      let lg = await log();
+      check("a compact driver that never reports a walk cut by its clock: full_output, and never timeout_ms (it would refuse a parameter it does not know)", gws(lg) === "plain full full", J(lg.calls));
+      await ctl("fake_exit", { next: { v055: true } });
+      await settle();
+      W = await win(781, FORM());
+      await ctl("fake_walk_cost", { ms: 5000 });
+      const up = await call("window_state", { ...W, include_screenshot: false });
+      const up2 = await call("window_state", { ...W, include_screenshot: false });
+      lg = await log();
+      check("upgraded to 0.55 under the hub, on a slow window: it learns both again from the new driver's replies, then asks for both from the start", !up.isError && !up2.isError && textOf(up).includes('AXButton "保存"') && !textOf(up).includes("⚠") && gws(lg) === "plain full full+20000 full+20000", J(lg.calls) + textOf(up));
+      await ctl("fake_exit", {});
+      await settle();
+      W = await win(781, FORM());
+      const down = await call("window_state", { ...W, include_screenshot: false });
+      lg = await log();
+      check("rolled back to 0.28 under the hub: neither full_output nor timeout_ms is sent to it", !down.isError && textOf(down).includes('AXButton "保存"') && gws(lg) === "plain", J(lg.calls) + textOf(down));
+    });
+  } finally {
+    await H.c.close().catch(() => {});
+  }
+}
+
 // 7.7 cancellation / batch budget must NOT kill a healthy backend. The SDK
 // wraps every abort into RequestTimeout (-32001); the hub used to treat that
 // as "backend hung" and SIGTERM cua — every element_token, diff baseline and

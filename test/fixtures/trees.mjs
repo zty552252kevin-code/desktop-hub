@@ -14,7 +14,14 @@
 // label === value === text.
 //
 // opts: { pid, windowId, title, win:{x,y,w,h}, mode:"both"|"md"|"els",
-//         omitMd:[idx], truncated:"AX tree truncated at …", trailingNewline }
+//         omitMd:[idx], truncated:"AX tree truncated at …", trailingNewline,
+//         grammar:"055" }
+// grammar "055" writes the bracket the way cua 0.55 does: every part optional
+// (`[id=… help="…" enabled=false actions=[…] custom_actions=["…"]]`, no bracket
+// when there is none), and an un-indexed row may carry `[help="…"]`. The
+// markdown never lists AXShowMenu / AXScrollToVisible (elements[] keeps them),
+// and a description equal to the title is not repeated.
+// Row opts for it: ca:["Pin"] = custom actions.
 
 export const WIN = { x: 100, y: 50, w: 1000, h: 700 };
 
@@ -44,9 +51,18 @@ export function payload(sid, rows, opts = {}) {
     } else {
       if (label !== null && label !== undefined) md += ` "${label}"`;
       if (o.v !== undefined) md += ` = "${o.v}"`;
-      if (o.desc !== undefined) md += ` (${o.desc})`;
+      if (o.desc !== undefined && !(opts.grammar === "055" && o.desc === label)) md += ` (${o.desc})`;
     }
-    if (indexed && (actions.length || o.id !== undefined || o.help !== undefined)) {
+    if (opts.grammar === "055") {
+      const parts = [];
+      if (indexed && o.id !== undefined) parts.push(`id=${o.id}`);
+      if (o.help !== undefined) parts.push(`help="${o.help}"`);
+      if (indexed && o.en === false) parts.push("enabled=false");
+      const shown = actions.filter((x) => x !== "AXShowMenu" && x !== "AXScrollToVisible");
+      if (indexed && shown.length) parts.push(`actions=[${shown.map(MD_ACTION).join(",")}]`);
+      if (indexed && o.ca?.length) parts.push(`custom_actions=[${o.ca.map((c) => JSON.stringify(c)).join(",")}]`);
+      if (parts.length) md += ` [${parts.join(" ")}]`;
+    } else if (indexed && (actions.length || o.id !== undefined || o.help !== undefined)) {
       const parts = [];
       if (o.id !== undefined) parts.push(`id=${o.id}`);
       if (o.help !== undefined) parts.push(`help="${o.help}"`);
