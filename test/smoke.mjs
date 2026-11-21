@@ -3285,7 +3285,24 @@ const TABLE = (names) => [
       await ctl("fake_next_reply", { refusal: { code: "window_not_key", form: "background", message: "invoke_menu: requested window 773 is not the confirmed document menu context (focused=Some(9001), main=Some(9001)); no menu action was dispatched" } });
       const mn = await call("act", { action: "menu", ...W, path: ["文件", "新建"] });
       lg = await log();
-      check("a menu sent through a window that is not the app's main one (0.55 refuses it, measured): the hub names the window to send it through, nothing was sent", mn.isError === true && /not executed/.test(textOf(mn)) && /the main one is window 9001/.test(textOf(mn)) && /send the menu with window_id 9001/.test(textOf(mn)) && !/no key was sent/.test(textOf(mn)) && lg.actions.length === 0, textOf(mn));
+      check("a menu sent through a window that is not the app's main one (0.55 refuses it, measured): the hub names the window to send it through, nothing was sent", mn.isError === true && /not executed/.test(textOf(mn)) && /window 9001 is\)/.test(textOf(mn)) && /send the menu with window_id 9001/.test(textOf(mn)) && !/no key was sent/.test(textOf(mn)) && lg.actions.length === 0, textOf(mn));
+      const menuNote = async (focused, main) => {
+        await ctl("fake_next_reply", { refusal: { code: "window_not_key", form: "background", message: `invoke_menu: requested window ${W.window_id} is not the confirmed document menu context (focused=${focused}, main=${main}); no menu action was dispatched` } });
+        const r = await call("act", { action: "menu", ...W, path: ["文件", "新建"] });
+        await log();
+        return r;
+      };
+      let mr = await menuNote("Some(9001)", `Some(${W.window_id})`);
+      check("a menu refused although this IS the main window (the focus is in a panel of the app): the hub does not tell it to resend through the same window", mr.isError === true && /this one is the main window, but the app's focus is in window 9001/.test(textOf(mr)) && !/send the menu with window_id/.test(textOf(mr)), textOf(mr));
+      mr = await menuNote("Some(9001)", "Some(9002)");
+      check("a menu refused where focus and main window differ: the hub does not point at the main window, which would be refused too", mr.isError === true && /main: window 9002; focus: window 9001/.test(textOf(mr)) && !/send the menu with window_id/.test(textOf(mr)), textOf(mr));
+      mr = await menuNote("None", "None");
+      check("a menu refused where the driver could not read either window: no window is named", mr.isError === true && /could not read which window/.test(textOf(mr)) && !/window_id \d/.test(textOf(mr)), textOf(mr));
+      await ctl("fake_next_reply", { structured: { effect: "confirmed", route: "accessibility", hint: "The click was sent. Read what changed before clicking again.", summary: 'Performed AXPress. Action opened new window(s): 802 "设置". Action caused a different app to become frontmost.' } });
+      const nw = await call("act", { action: "click", ...W, find: { label: "提交" } });
+      await call("window_state", { ...W, include_screenshot: false }); // clears the hub's "pressed this 0s ago" gate for the checks below
+      await log();
+      check("a routine click whose driver summary says it opened a window and changed the frontmost app: those two sentences reach the model, the routine hint does not", !nw.isError && /driver: Action opened new window\(s\): 802 "设置"\./.test(textOf(nw)) && /driver: Action caused a different app to become frontmost\./.test(textOf(nw)) && !/Read what changed before clicking again/.test(textOf(nw)) && (textOf(nw).match(/opened new window/g) ?? []).length === 1, textOf(nw));
       await ctl("fake_next_reply", { refusal: { code: "point_outside_window", form: "effect", message: "" } });
       const e = await call("act_batch", { ...W, steps: [{ action: "click", find: { label: "提交" } }, { action: "click", find: { label: "提交" }, again: true }] });
       lg = await log();

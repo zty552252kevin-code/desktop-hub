@@ -1,12 +1,12 @@
 # desktop-hub
 
-**A compact facade MCP server for macOS desktop automation.** It exposes just 11 hand-written tools (~3.4k tokens of definitions) and lazily proxies to two full-featured computer-use MCP servers — [cua-driver](https://github.com/trycua/cua) (56 tools, ~37k tokens as of 0.28.2; 61 tools and a third more text as of 0.55.0) and [computer-use-mcp](https://github.com/zavora-ai/computer-use-mcp) (64 tools, ~21k tokens) — plus native `osascript`. You keep the entire 120-tool surface, but your context window pays ~3.4k tokens instead of ~58k — and the results come back as compact text the hub renders itself (a browser window's tree in ~5% of the characters of the upstream JSON).
+**A compact facade MCP server for macOS desktop automation.** It exposes just 11 hand-written tools (~3.4k tokens of definitions) and lazily proxies to two full-featured computer-use MCP servers — [cua-driver](https://github.com/trycua/cua) (56 tools, ~37k tokens as of 0.28.2; 61 tools and a third more text as of 0.55.0) and [computer-use-mcp](https://github.com/zavora-ai/computer-use-mcp) (64 tools, ~21k tokens) — plus native `osascript`. You keep every tool of both, but your context window pays ~3.4k tokens instead of ~58k or more — and the results come back as compact text the hub renders itself (a browser window's tree in ~5% of the characters of the upstream JSON).
 
 [中文说明在下方](#中文说明) · [Gitee mirror 国内镜像](https://gitee.com/zty552252kevin/desktop-hub) · Works with Claude Code and any MCP client.
 
 ## Why
 
-Registering both upstream servers directly costs ~58k context tokens per session just for tool definitions, while the high-frequency surface is small. This facade keeps the hot path cheap and the long tail reachable:
+Registering both upstream servers directly costs ~58k context tokens or more per session just for tool definitions, while the high-frequency surface is small. This facade keeps the hot path cheap and the long tail reachable:
 
 ```
 MCP client ──stdio──> desktop-hub (this server, 11 compact tools)
@@ -28,7 +28,7 @@ MCP client ──stdio──> desktop-hub (this server, 11 compact tools)
 | `verify` | Deterministic assertions on window/element state after acting (→ cua `verify_state`) |
 | `zoom` | Cropped close-up of a window region for small text (→ cua) |
 | `run_script` | AppleScript/JXA via local `osascript` — no backend involved |
-| `desk_call` | Escape hatch: call ANY of the 120 underlying tools directly |
+| `desk_call` | Escape hatch: call ANY of the underlying tools directly |
 | `desk_describe` | On-demand catalog / full JSON schema of underlying tools (tokens spent only when needed) |
 
 ## Prerequisites

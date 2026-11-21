@@ -1946,6 +1946,15 @@ function actionEffect(res, s) {
     for (const k of ["hint", "next_call", "summary"]) {
       if (typeof sc[k] === "string" && sc[k]) hint += ` · ${k}: ${clip(sc[k], 200)}`;
     }
+  } else {
+    // Except what only the driver saw: 0.55 says in the summary (and the text), nowhere else, that the action
+    // opened a window or brought another app to the front — the hub's report below reads one window only.
+    const said = new Set();
+    const src = typeof sc.summary === "string" && sc.summary ? sc.summary : resultText(res);
+    for (const m of src.matchAll(/(?:Action opened new window\(s\):|After the previous action returned, it opened new window\(s\):)[^\n]*?(?= Action | After the previous action returned,|\n|$)|Action caused a different app to become frontmost\.|After the previous action returned, a different app became frontmost\./g)) {
+      said.add(m[0].trim());
+    }
+    for (const x of said) hint += ` · driver: ${clip(x, 200)}`;
   }
   const webNote = esc === "effect_unconfirmed";
   return { text: parts.length ? ` · ${stop ? "⚠ " : ""}${parts.join(" ")}${advice}${hint}` : hint, stop, webNote };
@@ -2450,11 +2459,16 @@ async function runSteps(input, signal, single) {
           // send nothing. Measured on 0.55.0 (TextEdit): a menu sent with the id of a window that is not the
           // main one is refused, and the refusal names the one that is.
           if (s.action === "menu") {
+            // The driver wants the window to be both the app's main window and its focused one.
             const main = /main=Some\((\d+)\)/.exec(t)?.[1];
-            throw new StepError(
-              `${up.trim()} — [desktop-hub] the driver sends a menu only through the app's main window, and this is not it${main ? ` (the main one is window ${main})` : ""}. A menu item acts on the main window whichever id it is sent with: if that is the window you mean, send the menu with ${main ? `window_id ${main}` : "its window_id (list_windows)"}; if it is not, the item would act on the wrong window — click into this window first.`,
-              "none"
-            );
+            const focused = /focused=Some\((\d+)\)/.exec(t)?.[1];
+            const here = String(s.window_id ?? "");
+            let why;
+            if (main && main === here) why = `this one is the main window, but the app's focus is in ${focused ? `window ${focused}` : "another window"} (a panel, sheet or dialog of the app): finish or close that first — a menu does not go through it either`;
+            else if (main && focused && focused !== main) why = `this one is neither (main: window ${main}; focus: window ${focused}, a panel, sheet or dialog of the app): finish or close that first`;
+            else if (main) why = `this one is not the main window (window ${main} is). A menu item acts on the main window whichever id it is sent with: if that is the window you mean, send the menu with window_id ${main}; if it is not, the item would act on the wrong window — click into this window first`;
+            else why = `the driver could not read which window that is right now. A menu item acts on the app's main window: find it with list_windows and send the menu with its id, or click into the window you mean first`;
+            throw new StepError(`${up.trim()} — [desktop-hub] the driver sends a menu only through a window that is both the app's main window and its focused one; ${why}.`, "none");
           }
           throw new StepError(`${up.trim()} — [desktop-hub] the driver could not make this window the app's key window, so no key was sent. A click into the field first (find, then click) may give it the focus; set_value on a field does not depend on it.`, "none");
         }
@@ -2888,7 +2902,7 @@ const server = new Server(
       "TEXT FIRST: the rows from window_state are the primary sense; every image costs a full vision turn, so take screenshots (include_screenshot:true, tree:false, zoom, desktop_screenshot) as checkpoints — when a press reports no change, on canvas/iPad-ported/WebView content, or right before an irreversible step. " +
       "Batch the steps you already know in one act_batch. Never repeat a press that reported no change without looking first. " +
       "After a context compaction or resume, tokens quoted in a summary are void — observe again. " +
-      "Full 120-tool surface of both underlying servers reachable via desk_call; schemas via desk_describe.",
+      "Every tool of both underlying servers is reachable via desk_call; schemas via desk_describe.",
   }
 );
 
